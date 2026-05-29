@@ -1,0 +1,12 @@
+# Normalize line endings to LF in the repository,
+# and convert to native line endings on checkout.
+* text=auto
+
+# Explicitly LF for all text files
+*.py text eol=lf
+*.md text eol=lf
+*.txt text eol=lf
+*.json text eol=lf
+*.env text eol=lf
+*.gitignore text eol=lf
+*.gitattributes text eol=lf

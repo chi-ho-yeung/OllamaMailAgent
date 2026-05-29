@@ -1,0 +1,30 @@
+# Environment variables (contains credentials)
+.env
+.env.local
+
+# OAuth cache tokens
+.token_cache
+token.json
+credentials.json
+
+# Service account keys
+service_account.json
+
+# Temporary/generated files
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+config/
