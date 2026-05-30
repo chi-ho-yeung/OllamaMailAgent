@@ -5,26 +5,125 @@ Runs in batches, labels emails, and gives you the option to move marked emails t
 
 ---
 
+## Project Goals
+
+### Proof of Concept: Small Models, Modest Hardware
+
+This project is a proof of concept for running useful AI agents on a mid-range laptop —
+specifically a machine with **16 GB RAM and ~2 GB VRAM**. No cloud API, no GPU cluster.
+Just a local Ollama instance and a small quantized model.
+
+The core thesis: **LLMs are exceptionally good at reading, summarizing, and evaluating
+the value of text.** Email is a perfect domain to test this — it is high-volume,
+mostly text, and the cost of mis-classification is low but the productivity gain of
+doing it well is high. The value of automation scales directly with inbox size: the
+larger and messier your inbox, the more time this saves.
+
+Small models (2–4B parameters) turn out to be well-suited for this task. Triage does
+not require deep reasoning — it requires pattern recognition, tone detection, and
+judgment about urgency. A 2B model running locally at ~23s per email is fast enough
+to clear a backlog overnight and is more than capable of making correct calls on
+newsletters, bills, appointments, and spam.
+
+### Approach: Deterministic Function Calls vs. Agentic Tool Calling
+
+This project deliberately takes a different architectural approach from
+[ollama-assistant-cli](https://github.com/chi-ho-yeung/ollama-assistant-cli), a companion
+project that uses the LLM as an agent — letting the model decide which tools to call,
+in what order, and how to chain them together via LangGraph.
+
+MailAgent does the opposite: **the LLM is called for one specific, bounded function** —
+read this email and return a structured triage decision. The code controls the flow
+entirely; the model never decides what happens next. This makes the app faster, more
+predictable, and easier to debug on constrained hardware.
+
+The two approaches represent a genuine trade-off:
+
+| | MailAgent (this project) | ollama-assistant-cli |
+|---|---|---|
+| **LLM role** | Performs a specific function | Drives agentic tool calling |
+| **Flow control** | Python code | LLM via LangGraph |
+| **Predictability** | High — same inputs, same behavior | Lower — model decides next step |
+| **Flexibility** | Low — one task, done well | High — open-ended tasks |
+| **Speed** | Faster — one call per email | Slower — multi-step reasoning |
+
+The hypothesis here is that for well-defined tasks with large volumes of data — like
+email triage — a deterministic, function-call model outperforms an open-ended agent
+both in speed and reliability on modest hardware.
+
+---
+
+A second goal is for the agent to **get better the longer it runs.** The current version
+is stateless — each batch starts fresh with no memory of past decisions. Future
+iterations should:
+
+- Track decisions and outcomes (e.g. emails you manually un-trash or re-label)
+- Build a personal profile of senders, domains, and topics you care about
+- Use that history to fine-tune the triage prompt or bias decisions for your inbox
+- Eventually flag patterns: *"You always delete emails from this sender"* or
+  *"Emails with this subject pattern consistently need attention"*
+
+The long-term vision is an agent that starts generic and converges toward your
+specific habits and preferences — without ever sending your data to the cloud.
+
+#### Label corrections as a learning signal
+
+The post-batch menu includes a **Correct a label** option (option 4) that lets you
+flip any email in the current batch from `1-NeedAttention` → `1-ToDelete` or vice
+versa. Each flip is a ground-truth signal: the LLM got it wrong, and you know why.
+
+Two failure modes are worth tracking separately:
+
+| Flip direction | What it means | Future use |
+|---|---|---|
+| `NeedAttention` → `ToDelete` | LLM was too cautious — gave ATTENTION to something that didn't warrant it | Could tighten the DELETE criteria in the prompt, or lower the relevance threshold for certain sender types |
+| `ToDelete` → `NeedAttention` | LLM was too aggressive — marked something important for deletion | Higher priority to fix; could add sender/domain to a soft-trust list, or add subject patterns to the ATTENTION criteria |
+
+The code currently applies the label flip immediately in Gmail. The next step is to
+persist each correction to `corrections.yml`. The planned format:
+
+```yaml
+corrections:
+  - date: '2026-05-29'
+    from: ToDelete
+    to: NeedAttention
+    sender: billing@acme.com
+    subject: Your invoice is ready
+    reason: ''   # optional note by user
+```
+
+Once enough corrections accumulate, they can be used to:
+- Automatically add frequently-corrected senders to the trusted list
+- Surface recurring patterns to the user ("You've corrected 5 emails from
+  newsletters this week — consider adjusting the promotions hint")
+- Eventually fine-tune the prompt with few-shot examples drawn from real corrections
+
+---
+
 ## How It Works
 
 ```
 1. Connect to Gmail API (OAuth 2.0)
 2. Connect to local Ollama instance, verify model is loaded
 3. Create triage labels in Gmail if they don't exist yet
-4. Find the 5 oldest inbox emails not yet labelled by this agent
+4. Find the 10 oldest inbox emails not yet labelled by this agent
 5. For each email:
-     - Extract subject, sender, date, and clean body text
-     - Ask the LLM to decide: DELETE or ATTENTION
-     - Apply the matching Gmail label
-6. Print a summary report
-7. If any emails were labelled 1-ToDelete, prompt:
-     "Do you want to move them to Trash? [y/N]"
-     - y → moves all 1-ToDelete emails to Gmail Trash (recoverable for 30 days)
-     - N / Enter → skips; emails stay labelled but untouched
+     - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip LLM
+     - Otherwise extract subject, sender, date, body, and Gmail category hint
+     - Ask the LLM to decide: DELETE or ATTENTION, with highlights and action
+     - Apply the matching Gmail label and archive (remove from INBOX)
+6. Print a batch performance report
+7. Post-batch menu:
+     1  Run another batch
+     2  Move marked emails to Trash (with confirmation)
+     3  Add a sender to the trusted contact list
+     4  Correct a label (flip DELETE ↔ ATTENTION)
+     x  Exit
 ```
 
-Emails labelled `1-ToDelete` are **not moved automatically**. After each batch the
-agent asks whether to send them to Trash — you stay in control every run.
+Emails labelled `1-ToDelete` are **not moved automatically**. Option 2 asks for
+confirmation before trashing — you stay in control every run. All labelled emails
+are archived out of the inbox immediately.
 
 ---
 
@@ -137,7 +236,7 @@ All settings live in `config.py` and `.env`:
 Batch size (emails per run) is set in `mailagent.py`:
 
 ```python
-BATCH_SIZE = 5
+BATCH_SIZE = 10
 ```
 
 ---
@@ -148,27 +247,44 @@ BATCH_SIZE = 5
 python mailagent.py
 ```
 
-The agent will print progress for each email and a summary report at the end:
+The agent processes each email and prints a per-email summary, then shows a
+performance report and the post-batch menu:
 
 ```
-...
+[1/10] Fetching email...
+  ✉  From    : Acme Billing <billing@acme.com>
+  📅 Date    : Thu, 29 May 2026 09:14:00 +0000
+  📝 Subject : Your invoice #4821 is ready
+  🏷  Category: Updates
+  🤖 Sending to LLM...
+  ⏱  Inference   : 21.3s
+  🏷️  Labelled → 1-NeedAttention
+  ✦ Invoice #4821 for $149.00 due June 5
+  ✦ PDF attachment included
+  👤 Sender Type : Automated Notification
+  ⚡ Action      : Pay before June 5
+  📊 Relevance   : 4/5
+  💡 Reason      : ...
+------------------------------------------------------------
+
 ========================================
       BATCH PERFORMANCE REPORT
 ========================================
-Emails Processed : 5
-  1-ToDelete          : 3
-  1-NeedAttention     : 2
-Avg Inference    : 1.45s
-Total Time       : 7.23s
+Emails Processed : 10
+  1-ToDelete          : 6
+  1-NeedAttention     : 4
+Avg Inference    : 22.1s
+Total Time       : 132.6s
 ========================================
 
-🗑️  3 email(s) were just marked as '1-ToDelete'.
-   Do you want to move them to Trash? [y/N]: y
+What would you like to do?
+  1  Run another batch
+  2  Move 6 marked email(s) to Trash
+  3  Add a sender to contact list
+  4  Correct a label
+  x  Exit
 
-🗑️  Moving emails to Trash...
-  🗑️  Trashed 3
-
-✅ Done — 3 email(s) moved to Trash.
+>
 ```
 
 Press **Ctrl+C** at any time to stop cleanly between emails.
@@ -253,6 +369,7 @@ mailagent/
 ├── config.py             # Model and account settings
 ├── refresh_oauth_token.py# OAuth token management
 ├── requirements.txt      # Python dependencies
+├── contacts.yml          # Trusted senders (auto-created, not committed)
 ├── .env                  # Credentials (not committed — see Setup)
 ├── credentials.json      # Google OAuth client config (not committed — see Setup)
 ├── token.json            # OAuth token (auto-managed, not committed)

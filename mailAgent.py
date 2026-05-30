@@ -11,6 +11,8 @@ ENVIRONMENT:
 - Ollama: qwen3.5:4b
 """
 
+import os
+import yaml
 import sys
 import time
 import json
@@ -25,7 +27,9 @@ from config import EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODE
 from refresh_oauth_token import get_gmail_service
 from bs4 import BeautifulSoup
 
-BATCH_SIZE = 5  # Number of oldest untagged emails to process per run
+BATCH_SIZE = 10  # Number of oldest untagged emails to process per run
+
+CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "contacts.yml")
 
 LABEL_NAMES = {
     "DELETE":    "1-ToDelete",
@@ -57,6 +61,52 @@ def clean_text(text_body):
         return ""
     soup = BeautifulSoup(text_body, "html.parser")
     return soup.get_text(separator="\n").strip()
+
+
+def load_contacts():
+    """Load trusted email addresses from YAML. Returns a set of lowercase addresses."""
+    if not os.path.exists(CONTACTS_FILE):
+        return set()
+    with open(CONTACTS_FILE, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    return set(addr.strip().lower() for addr in data.get("trusted", []))
+
+
+def save_contact(name, email_addr, notes=""):
+    """Add an email address to the trusted list. Skips if already present."""
+    email_addr = email_addr.strip().lower()
+
+    if os.path.exists(CONTACTS_FILE):
+        with open(CONTACTS_FILE, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    else:
+        data = {}
+
+    trusted = data.setdefault("trusted", [])
+    if email_addr in trusted:
+        print(f"  ℹ️  {email_addr} is already in your trusted list.")
+        return
+
+    trusted.append(email_addr)
+
+    with open(CONTACTS_FILE, "w", encoding="utf-8") as f:
+        yaml.dump(data, f, allow_unicode=True, default_flow_style=False, sort_keys=False)
+
+    label = f"{name} <{email_addr}>" if name else email_addr
+    print(f"  ✅ Trusted: {label}")
+
+
+def parse_sender(raw_from):
+    """Extract (name, email_addr) from a raw From header like 'Name <addr@x.com>'."""
+    import re as _re
+    m = _re.match(r'^(.*?)\s*<([^>]+)>', raw_from.strip())
+    if m:
+        name = m.group(1).strip().strip('"')
+        addr = m.group(2).strip()
+    else:
+        name = ""
+        addr = raw_from.strip()
+    return name, addr
 
 
 def get_or_create_label(service, name):
@@ -114,7 +164,6 @@ def fetch_untagged_emails(service, label_ids, batch_size):
             applied = set(meta.get("labelIds", []))
             if not applied.intersection(exclude_ids):
                 pool.append({"id": msg_ref["id"]})
-                print(f"  📥 Found untagged #{len(pool)}", end="\r")
                 if len(pool) >= batch_size:
                     break
 
@@ -122,7 +171,6 @@ def fetch_untagged_emails(service, label_ids, batch_size):
         if not page_token:
             break
 
-    print()  # newline after the \r progress
     return pool
 
 
@@ -165,7 +213,6 @@ def triage_and_label_emails():
         print(f"  ✓ Label ready: {name}")
 
     # Fetch oldest untagged emails
-    print(f"\nFetching {BATCH_SIZE} untagged inbox emails...")
     try:
         messages = fetch_untagged_emails(service, label_ids, BATCH_SIZE)
     except Exception as e:
@@ -177,13 +224,13 @@ def triage_and_label_emails():
         return
 
     total_emails = len(messages)
-    print(f"📬 Found {total_emails} emails to triage")
-    print(f"🚀 Processing with {OLLAMA_MODEL}...\n")
 
     metrics = {key: 0 for key in LABEL_NAMES}
     metrics["ERROR_FALLBACK"] = 0
     ai_times = []
-    delete_ids = []  # IDs labelled DELETE in this batch only
+    delete_ids = []    # IDs labelled DELETE in this batch only
+    batch_senders = [] # (msg_id, sender_raw, subject, decision) for each processed email
+    trusted = load_contacts()
 
 
     for index, msg_ref in enumerate(messages, start=1):
@@ -235,11 +282,23 @@ def triage_and_label_emails():
                 category_hint = f"Gmail category: '{label_name}'. {hint_text}"
                 break
 
+        _, sender_addr = parse_sender(sender)
+        trusted_hint = (
+            "IMPORTANT: This sender is in the user's trusted contact list — use ATTENTION, do not delete."
+            if sender_addr.lower() in trusted else ""
+        )
+
         print(f"  ✉  From    : {sender[:60]}")
         print(f"  📅 Date    : {date}")
         print(f"  📝 Subject : {str(subject)[:60]}")
         if gmail_category:
             print(f"  🏷  Category: {gmail_category}")
+        if trusted_hint:
+            print(f"  ✅ Trusted sender")
+
+        # Track for end-of-batch menu (decision filled in below)
+        entry = {"id": msg_ref["id"], "sender": sender, "subject": str(subject)[:60], "decision": None}
+        batch_senders.append(entry)
         # Extract body
         body = ""
         html_fallback = ""
@@ -268,6 +327,23 @@ def triage_and_label_emails():
             body = html_fallback
         body = body[:500]
 
+        if trusted_hint:
+            print(f"  ✅ Trusted sender — skipping LLM, labelling ATTENTION directly")
+            try:
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=msg_ref["id"],
+                        body={"addLabelIds": [label_ids["ATTENTION"]], "removeLabelIds": ["INBOX"]}
+                    ).execute
+                )
+                print(f"  🏷️  Labelled → {LABEL_NAMES['ATTENTION']}")
+            except (TimeoutError, Exception) as e:
+                print(f"  ⚠️  Label failed: {e}")
+            entry["decision"] = "ATTENTION"
+            metrics["ATTENTION"] += 1
+            print("-" * 60)
+            continue
+
         print(f"  🤖 Sending to LLM...")
 
         # Triage prompt
@@ -295,7 +371,7 @@ Body: {body.strip()}
 [EMAIL CONTENT END]
 
 Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
-{{"decision": {valid_keys}, "summary": "1 sentence: what this email is about", "sender_type": "e.g. Real Person / Newsletter / Automated Notification / Spam", "action_required": "e.g. None / Reply needed / Review by Friday", "relevance_score": <1-5>, "reason": "2-3 sentences: what the email is, why you scored it this way, and what tipped the decision."}}"""
+{{"decision": {valid_keys}, "highlights": ["key point 1", "key point 2"], "sender_type": "e.g. Real Person / Newsletter / Automated Notification / Spam", "action_required": "e.g. None / Reply needed / Review by Friday", "relevance_score": <1-5>, "reason": "2-3 sentences: what the email is, why you scored it this way, and what tipped the decision."}}"""
 
         # Run Ollama
         ai_start = time.time()
@@ -338,14 +414,16 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
             clean_response = re.sub(r"```$", "", clean_response).strip()
             result = json.loads(clean_response)
             decision = result.get("decision", default_decision).upper()
-            summary = result.get("summary", "")
+            highlights = result.get("highlights", [])
+            if isinstance(highlights, str):
+                highlights = [highlights]  # graceful fallback if model returns a string
             reason = result.get("reason", "No reason provided.")
             sender_type = result.get("sender_type", "Unknown")
             action_required = result.get("action_required", "None")
             relevance_score = result.get("relevance_score", "?")
         except Exception:
             decision = default_decision
-            summary = ""
+            highlights = []
             reason = f"Could not parse model response, defaulting to Attention. Raw: {response_text[:120]!r}"
             sender_type = action_required = "Unknown"
             relevance_score = "?"
@@ -358,14 +436,15 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
 
         metrics[decision] += 1
 
-        # Apply label via Gmail API
+        # Apply label via Gmail API — also remove from INBOX to archive it
         try:
             call_with_timeout(
                 service.users().messages().modify(
                     userId="me", id=msg_ref["id"],
-                    body={"addLabelIds": [label_ids[decision]], "removeLabelIds": []}
+                    body={"addLabelIds": [label_ids[decision]], "removeLabelIds": ["INBOX"]}
                 ).execute
             )
+            entry["decision"] = decision
             status_msg = f"🏷️  Labelled → {LABEL_NAMES[decision]}"
             if decision == "DELETE":
                 delete_ids.append(msg_ref["id"])
@@ -376,8 +455,9 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
 
         print(f"  ⏱  Inference   : {elapsed:.2f}s")
         print(f"  {status_msg}")
-        if summary:
-            print(f"  💬 Summary     : {summary}")
+        if highlights:
+            for hl in highlights:
+                print(f"  ✦ {hl}")
         print(f"  👤 Sender Type : {sender_type}")
         print(f"  ⚡ Action      : {action_required}")
         print(f"  📊 Relevance   : {relevance_score}/5")
@@ -385,7 +465,7 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
         print("-" * 60)
 
 
-    # Summary
+    # ── Summary report ────────────────────────────────────────────────────────
     total_processed = sum(metrics[k] for k in LABEL_NAMES)
     avg_ai_time = sum(ai_times) / len(ai_times) if ai_times else 0
 
@@ -401,41 +481,159 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
     print(f"Total Time       : {sum(ai_times):.2f}s")
     print("=" * 40 + "\n")
 
-    # ── Ask user whether to delete the emails just marked as ToDelete ──────────
+    # ── Post-batch menu ────────────────────────────────────────────────────────
     delete_count = metrics.get("DELETE", 0)
-    if delete_count > 0 and not _stop.is_set():
-        print(f"🗑️  {delete_count} email(s) were just marked as '{LABEL_NAMES['DELETE']}'.")
+
+    while not _stop.is_set():
+        print("What would you like to do?")
+        print("  1  Run another batch")
+        if delete_count > 0:
+            print(f"  2  Move {delete_count} marked email(s) to Trash")
+        print("  3  Add a sender to contact list")
+        print("  4  Correct a label")
+        print("  x  Exit")
         try:
-            answer = input("   Do you want to move them to Trash? [y/N]: ").strip().lower()
+            choice = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
-            answer = ""
+            break
 
-        if answer == "y":
-            print(f"\n🗑️  Moving {len(delete_ids)} email(s) to Trash...")
-            deleted = 0
-            errors = 0
+        if choice == "1":
+            print()
+            triage_and_label_emails()
+            return
 
-            for msg_id in delete_ids:
-                if _stop.is_set():
-                    break
-                try:
-                    call_with_timeout(
-                        service.users().messages().trash(
-                            userId="me", id=msg_id
-                        ).execute
-                    )
-                    deleted += 1
-                    print(f"  🗑️  Trashed {deleted}/{len(delete_ids)}", end="\r")
-                except Exception as e:
-                    print(f"\n  ⚠️  Could not trash {msg_id}: {e}")
-                    errors += 1
+        elif choice == "2":
+            if delete_count == 0:
+                print("  No emails were marked for deletion in this batch.\n")
+                continue
+            try:
+                confirm = input(f"  ⚠️  Move {len(delete_ids)} email(s) to Trash? This cannot be undone easily. [y/N]: ").strip().lower()
+            except (EOFError, KeyboardInterrupt):
+                confirm = ""
+            if confirm == "y":
+                print(f"\n🗑️  Moving {len(delete_ids)} email(s) to Trash...")
+                deleted = 0
+                errors = 0
+                for msg_id in delete_ids:
+                    if _stop.is_set():
+                        break
+                    try:
+                        call_with_timeout(
+                            service.users().messages().trash(
+                                userId="me", id=msg_id
+                            ).execute
+                        )
+                        deleted += 1
+                        print(f"  🗑️  Trashed {deleted}/{len(delete_ids)}", end="\r")
+                    except Exception as e:
+                        print(f"\n  ⚠️  Could not trash {msg_id}: {e}")
+                        errors += 1
+                print()
+                print(f"\n✅ Done — {deleted} email(s) moved to Trash.")
+                if errors:
+                    print(f"⚠️  {errors} email(s) could not be trashed.\n")
+                delete_ids.clear()
+                delete_count = 0
+            else:
+                print("  Skipped — emails remain labelled but not trashed.\n")
 
-            print()  # newline after \r progress
-            print(f"\n✅ Done — {deleted} email(s) moved to Trash.")
-            if errors:
-                print(f"⚠️  {errors} email(s) could not be trashed.")
+        elif choice == "3":
+            if not batch_senders:
+                print("  No senders available.\n")
+                continue
+            print("\n  Which email's sender would you like to add?")
+            for i, e in enumerate(batch_senders, start=1):
+                name, addr = parse_sender(e["sender"])
+                display = f"{name} <{addr}>" if name else addr
+                print(f"  [{i}/{len(batch_senders)}] {display}")
+                print(f"        Subject: {e['subject']}")
+            print("  (Enter number, or blank to cancel)")
+            try:
+                sel = input("\n  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sel = ""
+            if not sel:
+                print("  Cancelled.\n")
+                continue
+            try:
+                sel_idx = int(sel) - 1
+                if not (0 <= sel_idx < len(batch_senders)):
+                    raise ValueError
+            except ValueError:
+                print("  Invalid selection.\n")
+                continue
+            e = batch_senders[sel_idx]
+            name, addr = parse_sender(e["sender"])
+            print(f"\n  Sender : {name} <{addr}>")
+            try:
+                notes = input("  Notes (optional, press Enter to skip): ").strip()
+            except (EOFError, KeyboardInterrupt):
+                notes = ""
+            save_contact(name, addr, notes)
+            print()
+
+        elif choice == "4":
+            labelled = [e for e in batch_senders if e["decision"] is not None]
+            if not labelled:
+                print("  No labelled emails in this batch.\n")
+                continue
+            print("\n  Which email's label would you like to correct?")
+            for i, e in enumerate(labelled, start=1):
+                _, addr = parse_sender(e["sender"])
+                icon = "🗑️ " if e["decision"] == "DELETE" else "👀"
+                print(f"  [{i}/{len(labelled)}] {icon} {LABEL_NAMES[e['decision']]}")
+                print(f"        From   : {addr}")
+                print(f"        Subject: {e['subject']}")
+            print("  (Enter number, or blank to cancel)")
+            try:
+                sel = input("\n  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sel = ""
+            if not sel:
+                print("  Cancelled.\n")
+                continue
+            try:
+                sel_idx = int(sel) - 1
+                if not (0 <= sel_idx < len(labelled)):
+                    raise ValueError
+            except ValueError:
+                print("  Invalid selection.\n")
+                continue
+
+            e = labelled[sel_idx]
+            old_decision = e["decision"]
+            new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
+            old_label_id = label_ids[old_decision]
+            new_label_id = label_ids[new_decision]
+
+            try:
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=e["id"],
+                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
+                    ).execute
+                )
+                # Keep delete_ids in sync
+                if new_decision == "DELETE":
+                    delete_ids.append(e["id"])
+                    delete_count += 1
+                elif e["id"] in delete_ids:
+                    delete_ids.remove(e["id"])
+                    delete_count -= 1
+
+                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
+                print(f"  📝 Logged as correction for future learning.\n")
+                # TODO: log flip to corrections.yml for prompt improvement analysis
+                e["decision"] = new_decision
+            except Exception as ex:
+                print(f"  ⚠️  Failed to update label: {ex}\n")
+
+        elif choice == "x" or choice == "":
+            print("👋 Bye!")
+            break
+
         else:
-            print("   Skipped — emails remain labelled but not deleted.")
+            print("  Unrecognised option. Please choose 1, 2, 3, 4, or x.\n")
 
 
 if __name__ == "__main__":
