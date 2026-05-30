@@ -1,7 +1,7 @@
 # MailAgent — Email Triage Agent
 
-Automatically triages your Gmail inbox using a local LLM (Qwen 3.5 4B via Ollama).
-Runs in batches, labels emails, and never deletes anything without your review.
+Automatically triages your Gmail inbox using a local LLM (Qwen 3.5 via Ollama).
+Runs in batches, labels emails, and gives you the option to move marked emails to Trash.
 
 ---
 
@@ -17,10 +17,14 @@ Runs in batches, labels emails, and never deletes anything without your review.
      - Ask the LLM to decide: DELETE or ATTENTION
      - Apply the matching Gmail label
 6. Print a summary report
+7. If any emails were labelled 1-ToDelete, prompt:
+     "Do you want to move them to Trash? [y/N]"
+     - y → moves all 1-ToDelete emails to Gmail Trash (recoverable for 30 days)
+     - N / Enter → skips; emails stay labelled but untouched
 ```
 
-Emails are **never moved or deleted** by the agent. The `1-ToDelete` label is just
-a marker — you review and bulk-delete manually when ready.
+Emails labelled `1-ToDelete` are **not moved automatically**. After each batch the
+agent asks whether to send them to Trash — you stay in control every run.
 
 ---
 
@@ -44,7 +48,7 @@ To add or rename categories, edit only the `LABEL_NAMES` dict — everything els
 ## Requirements
 
 - Python 3.x
-- [Ollama](https://ollama.com/) running locally with `qwen3.5:4b` pulled
+- [Ollama](https://ollama.com/) running locally with `qwen3.5:2b` pulled (recommended — see [LLM Settings](#llm-settings))
 - Gmail API credentials (see [README_AUTH.md](README_AUTH.md))
 
 Install Python dependencies:
@@ -75,7 +79,7 @@ GOOGLE_CLIENT_SECRET=your-client-secret
 
 # Optional: override Ollama defaults
 OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=qwen3.5:4b
+OLLAMA_MODEL=qwen3.5:2b
 
 # Optional: path to labels config (default: config/labels.json)
 LABELS_PATH=config/labels.json
@@ -124,11 +128,11 @@ in your Gmail account automatically on first run if they don't already exist.
 
 All settings live in `config.py` and `.env`:
 
-| Setting        | Description                        |
-|----------------|------------------------------------|
-| `EMAIL_ACCOUNT`| Gmail address to process           |
-| `OLLAMA_MODEL` | Model name (default: `qwen3.5:4b`) |
-| `OLLAMA_HOST`  | Ollama server URL                  |
+| Setting        | Description                                     |
+|----------------|-------------------------------------------------|
+| `EMAIL_ACCOUNT`| Gmail address to process                        |
+| `OLLAMA_MODEL` | Model name (default: `qwen3.5:2b`, recommended) |
+| `OLLAMA_HOST`  | Ollama server URL                               |
 
 Batch size (emails per run) is set in `mailagent.py`:
 
@@ -147,11 +151,6 @@ python mailagent.py
 The agent will print progress for each email and a summary report at the end:
 
 ```
-[1/5] 1.23s
-Subject : Your Amazon order has shipped
-Action  : 🏷️  Labelled → 1-ToDelete
-Reason  : Shipping notification, not actionable.
-------------------------------------------------------------
 ...
 ========================================
       BATCH PERFORMANCE REPORT
@@ -162,6 +161,14 @@ Emails Processed : 5
 Avg Inference    : 1.45s
 Total Time       : 7.23s
 ========================================
+
+🗑️  3 email(s) were just marked as '1-ToDelete'.
+   Do you want to move them to Trash? [y/N]: y
+
+🗑️  Moving emails to Trash...
+  🗑️  Trashed 3
+
+✅ Done — 3 email(s) moved to Trash.
 ```
 
 Press **Ctrl+C** at any time to stop cleanly between emails.
@@ -172,11 +179,17 @@ Press **Ctrl+C** at any time to stop cleanly between emails.
 
 ### Model Performance
 
-| Model                  | Avg. inference time | Notes                        |
-|------------------------|--------------------:|------------------------------|
-| `qwen3.5:4b`           | ~60–70s             | Thinking disabled (see below)|
-| `qwen3.5:2b`           | TBD                 | Thinking disabled (see below)|
-| `qwen2.5:3b-instruct`  | ~10s                | No thinking mode, fast       |
+`qwen3.5:2b` is the recommended default — it produces accurate triage decisions and
+runs about 3× faster than the 4b variant, making it a good fit for most laptops.
+If you have a more powerful machine, `qwen3.5:4b` is also fully supported and may
+produce more nuanced reasoning on borderline emails. To switch models, just update
+`OLLAMA_MODEL` in your `.env`.
+
+| Model                  | Avg. inference time | Notes                             |
+|------------------------|--------------------:|-----------------------------------|
+| `qwen3.5:2b` ✅        | ~23s                | **Recommended default.** Fast and accurate |
+| `qwen3.5:4b`           | ~60–70s             | More powerful hardware recommended|
+| `qwen2.5:3b-instruct`  | ~10s                | No thinking mode, fast            |
 
 ### Per-Model Configuration
 

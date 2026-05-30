@@ -183,6 +183,7 @@ def triage_and_label_emails():
     metrics = {key: 0 for key in LABEL_NAMES}
     metrics["ERROR_FALLBACK"] = 0
     ai_times = []
+    delete_ids = []  # IDs labelled DELETE in this batch only
 
 
     for index, msg_ref in enumerate(messages, start=1):
@@ -199,6 +200,8 @@ def triage_and_label_emails():
                     userId="me", id=msg_ref["id"], format="raw"
                 ).execute
             )
+            # Capture Gmail category labels from the message metadata
+            gmail_labels = msg_data.get("labelIds", [])
             raw = base64.urlsafe_b64decode(msg_data["raw"].encode("utf-8"))
             msg = email.message_from_bytes(raw)
         except (TimeoutError, Exception) as e:
@@ -216,11 +219,27 @@ def triage_and_label_emails():
         sender = msg.get("From") or "Unknown"
         date = msg.get("Date") or "Unknown"
 
+        # Map Gmail category labels to human-readable hints
+        CATEGORY_MAP = {
+            "CATEGORY_PROMOTIONS": ("Promotions", "Lean DELETE — but use ATTENTION if there is a limited-time offer, expiring deal, or discount that may be genuinely useful."),
+            "CATEGORY_SOCIAL":     ("Social",     "Lean DELETE — social media notifications rarely need action."),
+            "CATEGORY_UPDATES":    ("Updates",    "Neutral — could go either way. Use ATTENTION for: appointments, bill due dates, payment confirmations, security alerts, account changes, shipping with action needed, or any deadline. Use DELETE for: generic digests, read receipts, routine status updates with no action required."),
+            "CATEGORY_FORUMS":     ("Forums",     "Lean DELETE — forum digests are rarely urgent."),
+            "CATEGORY_PERSONAL":   ("Personal",   "Lean ATTENTION — likely from a real person or a service tied to personal commitments."),
+        }
+        gmail_category = None
+        category_hint = ""
+        for label_id, (label_name, hint_text) in CATEGORY_MAP.items():
+            if label_id in gmail_labels:
+                gmail_category = label_name
+                category_hint = f"Gmail category: '{label_name}'. {hint_text}"
+                break
+
         print(f"  ✉  From    : {sender[:60]}")
         print(f"  📅 Date    : {date}")
         print(f"  📝 Subject : {str(subject)[:60]}")
-        print(f"  📄 Extracting body...")
-
+        if gmail_category:
+            print(f"  🏷  Category: {gmail_category}")
         # Extract body
         body = ""
         html_fallback = ""
@@ -249,10 +268,7 @@ def triage_and_label_emails():
             body = html_fallback
         body = body[:500]
 
-        body_preview = body[:80].replace("\n", " ").strip()
-        print(f"  💬 Body    : {body_preview}{'...' if len(body) > 80 else ''}")
         print(f"  🤖 Sending to LLM...")
-
 
         # Triage prompt
         valid_keys = " or ".join(f'"{k}"' for k in LABEL_NAMES)
@@ -260,14 +276,16 @@ def triage_and_label_emails():
 
 Be ruthless but practical. Prioritize actionability, personal relevance, and important commitments over generic updates.
 
+{category_hint}
+
 Evaluate the email across three dimensions:
 1. SENDER TYPE: Is it a real person, an automated system, a newsletter, a service notification, or spam?
 2. URGENCY & ACTION: Does it require a reply, an action, or has a deadline? Or is it purely informational/promotional?
 3. RELEVANCE: Is it directly tied to personal life, finances, health, legal matters, or active commitments?
 
 DECISION CRITERIA:
-- Use "DELETE" for: expired newsletters, marketing, shipping notifications, social media alerts, promotions, automated digests with no action required.
-- Use "ATTENTION" for: personal emails, receipts, medical, tax, bank alerts, legal notices, anything requiring a reply or action.
+- Use "ATTENTION" for: personal emails, bills or payment due, appointments or reminders, security alerts, account changes, receipts, medical, tax, legal notices, shipping requiring action, anything with a deadline or requiring a reply.
+- Use "DELETE" for: newsletters, marketing with no expiring offer, social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, generic status updates.
 
 [EMAIL CONTENT START]
 From: {sender}
@@ -277,7 +295,7 @@ Body: {body.strip()}
 [EMAIL CONTENT END]
 
 Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
-{{"decision": {valid_keys}, "sender_type": "e.g. Real Person / Newsletter / Automated Notification / Spam", "action_required": "e.g. None / Reply needed / Review by Friday", "relevance_score": <1-5>, "reason": "2-3 sentences: what the email is, why you scored it this way, and what tipped the decision."}}"""
+{{"decision": {valid_keys}, "summary": "1 sentence: what this email is about", "sender_type": "e.g. Real Person / Newsletter / Automated Notification / Spam", "action_required": "e.g. None / Reply needed / Review by Friday", "relevance_score": <1-5>, "reason": "2-3 sentences: what the email is, why you scored it this way, and what tipped the decision."}}"""
 
         # Run Ollama
         ai_start = time.time()
@@ -311,8 +329,6 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
         elapsed = time.time() - ai_start
         ai_times.append(elapsed)
 
-        print(f"  📨 Raw LLM : {response_text[:120]!r}")
-
         # Parse decision — strip <think>...</think> blocks Qwen3 thinking mode emits
         valid_decisions = list(LABEL_NAMES.keys())
         default_decision = valid_decisions[-1]  # "ATTENTION"
@@ -322,12 +338,14 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
             clean_response = re.sub(r"```$", "", clean_response).strip()
             result = json.loads(clean_response)
             decision = result.get("decision", default_decision).upper()
+            summary = result.get("summary", "")
             reason = result.get("reason", "No reason provided.")
             sender_type = result.get("sender_type", "Unknown")
             action_required = result.get("action_required", "None")
             relevance_score = result.get("relevance_score", "?")
         except Exception:
             decision = default_decision
+            summary = ""
             reason = f"Could not parse model response, defaulting to Attention. Raw: {response_text[:120]!r}"
             sender_type = action_required = "Unknown"
             relevance_score = "?"
@@ -349,6 +367,8 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
                 ).execute
             )
             status_msg = f"🏷️  Labelled → {LABEL_NAMES[decision]}"
+            if decision == "DELETE":
+                delete_ids.append(msg_ref["id"])
         except (TimeoutError, Exception) as e:
             print(f"⚠️  Label failed for {msg_ref['id']}: {e}")
             metrics["ERROR_FALLBACK"] += 1
@@ -356,6 +376,8 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
 
         print(f"  ⏱  Inference   : {elapsed:.2f}s")
         print(f"  {status_msg}")
+        if summary:
+            print(f"  💬 Summary     : {summary}")
         print(f"  👤 Sender Type : {sender_type}")
         print(f"  ⚡ Action      : {action_required}")
         print(f"  📊 Relevance   : {relevance_score}/5")
@@ -378,6 +400,42 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
     print(f"Avg Inference    : {avg_ai_time:.2f}s")
     print(f"Total Time       : {sum(ai_times):.2f}s")
     print("=" * 40 + "\n")
+
+    # ── Ask user whether to delete the emails just marked as ToDelete ──────────
+    delete_count = metrics.get("DELETE", 0)
+    if delete_count > 0 and not _stop.is_set():
+        print(f"🗑️  {delete_count} email(s) were just marked as '{LABEL_NAMES['DELETE']}'.")
+        try:
+            answer = input("   Do you want to move them to Trash? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+
+        if answer == "y":
+            print(f"\n🗑️  Moving {len(delete_ids)} email(s) to Trash...")
+            deleted = 0
+            errors = 0
+
+            for msg_id in delete_ids:
+                if _stop.is_set():
+                    break
+                try:
+                    call_with_timeout(
+                        service.users().messages().trash(
+                            userId="me", id=msg_id
+                        ).execute
+                    )
+                    deleted += 1
+                    print(f"  🗑️  Trashed {deleted}/{len(delete_ids)}", end="\r")
+                except Exception as e:
+                    print(f"\n  ⚠️  Could not trash {msg_id}: {e}")
+                    errors += 1
+
+            print()  # newline after \r progress
+            print(f"\n✅ Done — {deleted} email(s) moved to Trash.")
+            if errors:
+                print(f"⚠️  {errors} email(s) could not be trashed.")
+        else:
+            print("   Skipped — emails remain labelled but not deleted.")
 
 
 if __name__ == "__main__":
