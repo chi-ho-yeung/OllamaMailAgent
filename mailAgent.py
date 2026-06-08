@@ -34,6 +34,7 @@ CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "contacts.yml")
 LABEL_NAMES = {
     "DELETE":    "1-ToDelete",
     "ATTENTION": "1-NeedAttention",
+    "ERROR":     "1-ProcessError",
 }
 
 # Global stop event — set by Ctrl+C handler
@@ -225,7 +226,7 @@ def triage_and_label_emails():
 
     total_emails = len(messages)
 
-    metrics = {key: 0 for key in LABEL_NAMES}
+    metrics = {key: 0 for key in LABEL_NAMES}  # DELETE, ATTENTION, ERROR
     metrics["ERROR_FALLBACK"] = 0
     ai_times = []
     delete_ids = []    # IDs labelled DELETE in this batch only
@@ -237,8 +238,6 @@ def triage_and_label_emails():
         if _stop.is_set():
             print("\n⚠️  Stopped by user.")
             break
-
-        print(f"\n[{index}/{total_emails}] Fetching email...")
 
         # Fetch full message
         try:
@@ -252,7 +251,7 @@ def triage_and_label_emails():
             raw = base64.urlsafe_b64decode(msg_data["raw"].encode("utf-8"))
             msg = email.message_from_bytes(raw)
         except (TimeoutError, Exception) as e:
-            print(f"  ⚠️  Failed to fetch: {e}")
+            print(f"\n[{index}/{total_emails}] ⚠️  Failed to fetch: {e}")
             metrics["ERROR_FALLBACK"] += 1
             continue
 
@@ -264,7 +263,9 @@ def triage_and_label_emails():
             subject = "No Subject"
 
         sender = msg.get("From") or "Unknown"
-        date = msg.get("Date") or "Unknown"
+        raw_date = msg.get("Date") or "Unknown"
+        # Simplify date: remove time portion (e.g. Wed, 20 May 2026 21:26:42 +0000 -> Wed, 20 May 2026)
+        date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
 
         # Map Gmail category labels to human-readable hints
         CATEGORY_MAP = {
@@ -288,11 +289,10 @@ def triage_and_label_emails():
             if sender_addr.lower() in trusted else ""
         )
 
-        print(f"  ✉  From    : {sender[:60]}")
-        print(f"  📅 Date    : {date}")
-        print(f"  📝 Subject : {str(subject)[:60]}")
-        if gmail_category:
-            print(f"  🏷  Category: {gmail_category}")
+        cat_str = f"[{gmail_category}] " if gmail_category else ""
+        max_sender_len = max(30, 65 - len(cat_str))
+        print(f"\n[{index}/{total_emails}] {cat_str}From: {sender[:max_sender_len]}")
+        print(f"  📅 {date} | 📝 {str(subject)[:70]}")
         if trusted_hint:
             print(f"  ✅ Trusted sender")
 
@@ -336,7 +336,7 @@ def triage_and_label_emails():
                         body={"addLabelIds": [label_ids["ATTENTION"]], "removeLabelIds": ["INBOX"]}
                     ).execute
                 )
-                print(f"  🏷️  Labelled → {LABEL_NAMES['ATTENTION']}")
+                print(f"  👁️  → {LABEL_NAMES['ATTENTION']}")
             except (TimeoutError, Exception) as e:
                 print(f"  ⚠️  Label failed: {e}")
             entry["decision"] = "ATTENTION"
@@ -344,10 +344,8 @@ def triage_and_label_emails():
             print("-" * 60)
             continue
 
-        print(f"  🤖 Sending to LLM...")
-
-        # Triage prompt
-        valid_keys = " or ".join(f'"{k}"' for k in LABEL_NAMES)
+        # Triage prompt — only DELETE and ATTENTION are valid LLM outputs; ERROR is reserved for processing failures
+        valid_keys_list = ["DELETE", "ATTENTION"]
         prompt = f"""You are an advanced AI email triage assistant. Analyze the email below and decide whether it needs attention or should be deleted.
 
 Be ruthless but practical. Prioritize actionability, personal relevance, and important commitments over generic updates.
@@ -370,8 +368,15 @@ Subject: {subject}
 Body: {body.strip()}
 [EMAIL CONTENT END]
 
-Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
-{{"decision": {valid_keys}, "highlights": ["key point 1", "key point 2"], "sender_type": "e.g. Real Person / Newsletter / Automated Notification / Spam", "action_required": "e.g. None / Reply needed / Review by Friday", "relevance_score": <1-5>, "reason": "2-3 sentences: what the email is, why you scored it this way, and what tipped the decision."}}"""
+IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
+{{
+  "decision": "{valid_keys_list[0]}" or "{valid_keys_list[1]}",
+  "summary": "1 sentence summary",
+  "sender_type": "string",
+  "action_required": "string",
+  "relevance_score": 1-5,
+  "reason": "explanation"
+}}"""
 
         # Run Ollama
         ai_start = time.time()
@@ -379,11 +384,22 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
             chat_kwargs = {
                 "model": OLLAMA_MODEL,
                 "messages": [{"role": "user", "content": prompt}],
-                "think": False,
             }
-            model_options = MODEL_CONFIGS.get(OLLAMA_MODEL)
-            if model_options is not None:
+            
+            # Use the model's specific config
+            model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, {}).copy()
+            
+            # "format" is a top-level parameter in ollama.chat
+            if "format" in model_options:
+                chat_kwargs["format"] = model_options.pop("format")
+            
+            # "think" is a top-level parameter for models that support it
+            if "think" in model_options:
+                chat_kwargs["think"] = model_options.pop("think")
+            
+            if model_options:
                 chat_kwargs["options"] = model_options
+                
             response = ollama_client.chat(**chat_kwargs)
             # Handle both dict and object (ChatResponse) returns from ollama library
             if isinstance(response, dict):
@@ -399,69 +415,82 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
             raise
         except Exception as e:
             print(f"⚠️  Ollama error: {e}")
-            metrics["ERROR_FALLBACK"] += 1
+            elapsed = time.time() - ai_start
+            ai_times.append(elapsed)
+            try:
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=msg_ref["id"],
+                        body={"addLabelIds": [label_ids["ERROR"]], "removeLabelIds": []}
+                    ).execute
+                )
+                entry["decision"] = "ERROR"
+                metrics["ERROR_FALLBACK"] += 1
+                print(f"  ⚙️  Labelled → {LABEL_NAMES['ERROR']} (Ollama unreachable)")
+            except Exception as label_err:
+                print(f"  ⚠️  Could not apply error label: {label_err}")
+            print("-" * 60)
             continue
 
         elapsed = time.time() - ai_start
         ai_times.append(elapsed)
 
         # Parse decision — strip <think>...</think> blocks Qwen3 thinking mode emits
-        valid_decisions = list(LABEL_NAMES.keys())
-        default_decision = valid_decisions[-1]  # "ATTENTION"
+        valid_decisions = ["DELETE", "ATTENTION"]
         try:
             clean_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
             clean_response = re.sub(r"^```(?:json)?", "", clean_response).strip()
             clean_response = re.sub(r"```$", "", clean_response).strip()
             result = json.loads(clean_response)
-            decision = result.get("decision", default_decision).upper()
-            highlights = result.get("highlights", [])
-            if isinstance(highlights, str):
-                highlights = [highlights]  # graceful fallback if model returns a string
+            decision = result.get("decision", "").upper()
+            summary = result.get("summary", "")
             reason = result.get("reason", "No reason provided.")
             sender_type = result.get("sender_type", "Unknown")
             action_required = result.get("action_required", "None")
             relevance_score = result.get("relevance_score", "?")
         except Exception:
-            decision = default_decision
-            highlights = []
-            reason = f"Could not parse model response, defaulting to Attention. Raw: {response_text[:120]!r}"
+            decision = "ERROR"
+            summary = ""
+            reason = f"Could not parse model response. Raw: {response_text[:120]!r}"
             sender_type = action_required = "Unknown"
             relevance_score = "?"
             metrics["ERROR_FALLBACK"] += 1
 
         if decision not in valid_decisions:
-            decision = default_decision
-            reason = "Invalid decision, corrected to Attention."
+            decision = "ERROR"
+            reason = f"Model returned unrecognised decision, tagged for review. Raw decision: {result.get('decision', '?')!r}" if 'result' in dir() else reason
             metrics["ERROR_FALLBACK"] += 1
 
-        metrics[decision] += 1
+        metrics[decision] = metrics.get(decision, 0) + 1
 
-        # Apply label via Gmail API — also remove from INBOX to archive it
+        # Apply label — DELETE removes from INBOX (archived), ATTENTION/ERROR keep it visible
+        labels_to_remove = ["INBOX"] if decision == "DELETE" else []
         try:
             call_with_timeout(
                 service.users().messages().modify(
                     userId="me", id=msg_ref["id"],
-                    body={"addLabelIds": [label_ids[decision]], "removeLabelIds": ["INBOX"]}
+                    body={"addLabelIds": [label_ids[decision]], "removeLabelIds": labels_to_remove}
                 ).execute
             )
             entry["decision"] = decision
-            status_msg = f"🏷️  Labelled → {LABEL_NAMES[decision]}"
             if decision == "DELETE":
+                decision_icon = "🗑️ "
                 delete_ids.append(msg_ref["id"])
+            elif decision == "ATTENTION":
+                decision_icon = "👁️ "
+            else:  # ERROR
+                decision_icon = "⚙️ "
         except (TimeoutError, Exception) as e:
             print(f"⚠️  Label failed for {msg_ref['id']}: {e}")
             metrics["ERROR_FALLBACK"] += 1
-            status_msg = "⚠️  Label failed"
+            decision_icon = "⚠️ "
 
-        print(f"  ⏱  Inference   : {elapsed:.2f}s")
-        print(f"  {status_msg}")
-        if highlights:
-            for hl in highlights:
-                print(f"  ✦ {hl}")
-        print(f"  👤 Sender Type : {sender_type}")
-        print(f"  ⚡ Action      : {action_required}")
-        print(f"  📊 Relevance   : {relevance_score}/5")
-        print(f"  💡 Reason      : {reason}")
+        # Reprint header with final decision icon (replaces the ⏳ placeholder)
+        label_name = LABEL_NAMES.get(decision, "label-failed")
+        print(f"  {decision_icon}{label_name} | ⏱ {elapsed:.1f}s | 📊 Rel: {relevance_score}/5")
+        if summary:
+            print(f"  💬 {summary}")
+        print(f"  💡 {reason}")
         print("-" * 60)
 
 
@@ -473,8 +502,9 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
     print("      BATCH PERFORMANCE REPORT")
     print("=" * 40)
     print(f"Emails Processed : {total_processed}")
+    icons = {"DELETE": "🗑️ ", "ATTENTION": "👁️ ", "ERROR": "⚙️ "}
     for key, name in LABEL_NAMES.items():
-        print(f"  {name:<20}: {metrics[key]}")
+        print(f"  {icons.get(key, '  ')}{name:<20}: {metrics[key]}")
     if metrics["ERROR_FALLBACK"]:
         print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
     print(f"Avg Inference    : {avg_ai_time:.2f}s")
@@ -580,7 +610,7 @@ Respond ONLY with this JSON — no markdown, no explanation, no thinking tags:
             print("\n  Which email's label would you like to correct?")
             for i, e in enumerate(labelled, start=1):
                 _, addr = parse_sender(e["sender"])
-                icon = "🗑️ " if e["decision"] == "DELETE" else "👀"
+                icon = "🗑️ " if e["decision"] == "DELETE" else ("👁️ " if e["decision"] == "ATTENTION" else "⚙️ ")
                 print(f"  [{i}/{len(labelled)}] {icon} {LABEL_NAMES[e['decision']]}")
                 print(f"        From   : {addr}")
                 print(f"        Subject: {e['subject']}")
