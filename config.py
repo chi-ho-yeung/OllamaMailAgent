@@ -31,20 +31,37 @@ def get_auth_type():
 # Check if Ollama is running
 import ollama as ollama_client
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi4-mini")
 OLLAMA_CLIENT = ollama_client
 
 # Per-model Ollama options. Set to None to use Ollama defaults for that model.
 # Note: think=False is passed as a top-level ollama.chat() param, not here.
 MODEL_CONFIGS = {
-    "qwen2.5:3b-instruct": None,           # no options override for 2.5
-    "qwen3.5:4b": {
+    "qwen2.5:3b-instruct": {"num_ctx": 8192},
+    "qwen3.5:4b": { "format": "json",
+        "num_ctx": 16384,
         "temperature": 0.5,
         "top_p": 0.8,
     },
-    "qwen3.5:2b": {
+    "qwen3.5:2b": { "format": "json",
+        "num_ctx": 16384,
         "temperature": 0.7,
         "top_p": 0.8,
+    },
+    "phi4-mini": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False
+    },
+    "granite4.1:3b": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False
+    },
+    "ministral-3:3b": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False
     },
 }
 
