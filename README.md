@@ -111,7 +111,10 @@ Once enough corrections accumulate, they can be used to:
      - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip LLM
      - Otherwise extract subject, sender, date, body, and Gmail category hint
      - Ask the LLM to decide: DELETE or ATTENTION, with highlights and action
-     - Apply the matching Gmail label and archive (remove from INBOX)
+     - Apply the matching Gmail label
+       · DELETE    → archived (removed from INBOX)
+       · ATTENTION → label applied, stays in INBOX
+       · ERROR     → label applied, stays in INBOX for manual review
 6. Print a batch performance report
 7. Post-batch menu:
      1  Run another batch
@@ -122,8 +125,8 @@ Once enough corrections accumulate, they can be used to:
 ```
 
 Emails labelled `1-ToDelete` are **not moved automatically**. Option 2 asks for
-confirmation before trashing — you stay in control every run. All labelled emails
-are archived out of the inbox immediately.
+confirmation before trashing — you stay in control every run. Only DELETE emails
+are archived out of the inbox; ATTENTION and ERROR emails remain visible.
 
 ---
 
@@ -131,10 +134,11 @@ are archived out of the inbox immediately.
 
 Defined in `LABEL_NAMES` at the top of `mailagent.py`:
 
-| Key         | Gmail Label      | Criteria |
-|-------------|------------------|----------|
-| `DELETE`    | `1-ToDelete`     | Newsletters, marketing, shipping alerts, social media, promotions |
-| `ATTENTION` | `1-NeedAttention`| Personal emails, receipts, medical, tax, bank alerts, legal notices |
+| Key         | Gmail Label       | Icon | Inbox | Criteria |
+|-------------|-------------------|------|-------|----------|
+| `DELETE`    | `1-ToDelete`      | 🗑️   | Archived | Newsletters, marketing, shipping alerts, social media, promotions |
+| `ATTENTION` | `1-NeedAttention` | 👁️   | Kept  | Personal emails, receipts, medical, tax, bank alerts, legal notices |
+| `ERROR`     | `1-ProcessError`  | ⚙️   | Kept  | LLM could not parse the email or returned an invalid decision — review manually |
 
 Labels are created automatically on first run. The `1-` prefix makes them sort
 to the top of your Gmail label list.
@@ -147,7 +151,7 @@ To add or rename categories, edit only the `LABEL_NAMES` dict — everything els
 ## Requirements
 
 - Python 3.x
-- [Ollama](https://ollama.com/) running locally with `qwen3.5:2b` pulled (recommended — see [LLM Settings](#llm-settings))
+- [Ollama](https://ollama.com/) running locally with your chosen model pulled (see [LLM Settings](#llm-settings))
 - Gmail API credentials (see [README_AUTH.md](README_AUTH.md))
 
 Install Python dependencies:
@@ -251,28 +255,27 @@ The agent processes each email and prints a per-email summary, then shows a
 performance report and the post-batch menu:
 
 ```
-[1/10] Fetching email...
-  ✉  From    : Acme Billing <billing@acme.com>
-  📅 Date    : Thu, 29 May 2026 09:14:00 +0000
-  📝 Subject : Your invoice #4821 is ready
-  🏷  Category: Updates
-  🤖 Sending to LLM...
-  ⏱  Inference   : 21.3s
-  🏷️  Labelled → 1-NeedAttention
-  ✦ Invoice #4821 for $149.00 due June 5
-  ✦ PDF attachment included
-  👤 Sender Type : Automated Notification
-  ⚡ Action      : Pay before June 5
-  📊 Relevance   : 4/5
-  💡 Reason      : ...
+[2/10] [Updates] From: "Amazon.com" <auto-confirm@amazon.com>
+  📅 Tue, 19 May 2026 | 📝 Ordered: "FUMAX Shower Door Hooks 10..."
+  🗑️ 1-ToDelete | ⏱ 26.9s | 📊 Rel: 1/5
+  💬 Amazon shipping confirmation for a non-actionable, already-delivered order.
+  💡 Routine delivery confirmation with no deadlines or follow-up action needed.
+------------------------------------------------------------
+
+[3/10] [Personal] From: billing@acme.com
+  📅 Thu, 29 May 2026 | 📝 Your invoice #4821 is ready
+  👁️ 1-NeedAttention | ⏱ 21.3s | 📊 Rel: 4/5
+  💬 Invoice #4821 for $149.00 due June 5 with PDF attached.
+  💡 Bill with a deadline requiring action — kept in inbox.
 ------------------------------------------------------------
 
 ========================================
       BATCH PERFORMANCE REPORT
 ========================================
 Emails Processed : 10
-  1-ToDelete          : 6
-  1-NeedAttention     : 4
+  🗑️ 1-ToDelete          : 6
+  👁️ 1-NeedAttention     : 3
+  ⚙️ 1-ProcessError      : 1
 Avg Inference    : 22.1s
 Total Time       : 132.6s
 ========================================
@@ -297,15 +300,16 @@ Press **Ctrl+C** at any time to stop cleanly between emails.
 
 `qwen3.5:2b` is the recommended default — it produces accurate triage decisions and
 runs about 3× faster than the 4b variant, making it a good fit for most laptops.
-If you have a more powerful machine, `qwen3.5:4b` is also fully supported and may
-produce more nuanced reasoning on borderline emails. To switch models, just update
-`OLLAMA_MODEL` in your `.env`.
+To switch models, update `OLLAMA_MODEL` in your `.env`.
 
-| Model                  | Avg. inference time | Notes                             |
-|------------------------|--------------------:|-----------------------------------|
-| `qwen3.5:2b` ✅        | ~23s                | **Recommended default.** Fast and accurate |
-| `qwen3.5:4b`           | ~60–70s             | More powerful hardware recommended|
-| `qwen2.5:3b-instruct`  | ~10s                | No thinking mode, fast            |
+| Model                  | Avg. inference time | Thinking mode | Notes                             |
+|------------------------|--------------------:|:-------------:|-----------------------------------|
+| `qwen3.5:2b` ✅        | ~23s                | Suppressed    | **Recommended default.** Fast and accurate |
+| `qwen3.5:4b`           | ~60–70s             | Suppressed    | More powerful hardware recommended |
+| `qwen2.5:3b-instruct`  | ~10s                | None          | No thinking mode, very fast        |
+| `phi4-mini`            | ~15s                | Suppressed    | Microsoft model, compact and capable |
+| `granite4.1:3b`        | ~12s                | Suppressed    | IBM Granite, strong instruction following |
+| `ministral-3:3b`       | ~10s                | Suppressed    | Mistral's 3B, fast and efficient   |
 
 ### Per-Model Configuration
 
@@ -313,26 +317,48 @@ Each model can have its own `options` block (or none at all) defined in `config.
 
 ```python
 MODEL_CONFIGS = {
-    "qwen2.5:3b-instruct": None,        # use Ollama defaults
+    "qwen2.5:3b-instruct": {"num_ctx": 8192},
     "qwen3.5:4b": {
+        "format": "json",
+        "num_ctx": 16384,
         "temperature": 0.5,
         "top_p": 0.8,
     },
     "qwen3.5:2b": {
+        "format": "json",
+        "num_ctx": 16384,
         "temperature": 0.7,
         "top_p": 0.8,
+    },
+    "phi4-mini": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False,
+    },
+    "granite4.1:3b": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False,
+    },
+    "ministral-3:3b": {
+        "num_ctx": 16384,
+        "format": "json",
+        "think": False,
     },
 }
 ```
 
 `temperature` and `top_p` values are Qwen's recommended defaults for non-thinking
-mode. Adjust to tune creativity vs. consistency.
+mode. Adjust to tune creativity vs. consistency. Models without thinking mode
+(`qwen2.5:3b-instruct`) need no `think` key at all.
 
-### Disabling Thinking Mode (Qwen3)
+To add a new model, add an entry to `MODEL_CONFIGS` with `format: "json"` and
+`think: False` if the model supports thinking mode. Pull it with `ollama pull
+<model>` and set `OLLAMA_MODEL` in `.env`.
 
-Qwen3 models ship with an extended chain-of-thought reasoning mode that generates
-a large `<think>...</think>` block before every answer. Left enabled, this inflated
-a single email analysis from ~60s to nearly **400s**.
+### Suppressing Thinking Mode
+
+Several supported models ship with an extended chain-of-thought reasoning mode that generates a large `<think>...</think>` block before every answer. However, small LLMs typically struggle with reasoning at this scale; the cognitive overhead often outweighs any quality gain. For Qwen3.5, leaving thinking enabled inflated a single email analysis from ~60s to nearly 400s without significant improvement in triage accuracy. Other models of this size typically do not support reasoning modes and are more performant as a result.
 
 Three things are needed to fully suppress it — getting any one of them wrong leaves
 thinking partially or fully active:
@@ -357,7 +383,8 @@ clean = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip(
 ```
 
 > **Note:** `qwen2.5:3b-instruct` does not have a thinking mode — `think=False`
-> is a no-op for that model and `MODEL_CONFIGS` sets no options override.
+> is a no-op for that model. The `phi4-mini`, `granite4.1:3b`, and `ministral-3:3b`
+> models support the flag and have it set in `MODEL_CONFIGS`.
 
 ---
 
