@@ -7,8 +7,9 @@ import json
 from dotenv import load_dotenv
 from pathlib import Path
 
-# Load environment variables from .env (if exists)
-load_dotenv()
+# Load environment variables from secrets/.env (if exists)
+SECRETS_DIR = Path(__file__).parent / "secrets"
+load_dotenv(SECRETS_DIR / ".env")
 
 # ============================================
 # AUTHENTICATION (OAuth 2.0)
@@ -120,13 +121,13 @@ def save_oauth_token(token_path=None):
     Save OAuth access token to file (for persistence across restarts)
     
     Args:
-        token_path: Path to save token (default: .token_cache)
+        token_path: Path to save token (default: secrets/.token_cache)
     
     Returns:
         dict: {'token_path': path, 'token_saved': True/False, 'error': error if any}
     """
     if token_path is None:
-        token_path = ".token_cache"
+        token_path = SECRETS_DIR / ".token_cache"
     
     if len(GOOGLE_TOKEN) > 10 and GOOGLE_TOKEN != os.getenv("GOOGLE_TOKEN", ""):
         try:

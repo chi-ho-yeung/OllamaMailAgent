@@ -1,14 +1,6 @@
-# Environment variables (contains credentials)
-.env
-.env.local
-
-# OAuth cache tokens
-.token_cache
-token.json
-credentials.json
-
-# Service account keys
-service_account.json
+# Local-only files (credentials, tokens, contacts, anything sensitive)
+# Everything that must never be committed lives in here.
+secrets/
 
 # Temporary/generated files
 __pycache__/
