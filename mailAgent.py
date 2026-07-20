@@ -29,7 +29,7 @@ from bs4 import BeautifulSoup
 
 BATCH_SIZE = 10  # Number of oldest untagged emails to process per run
 
-CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "contacts.yml")
+CONTACTS_FILE = os.path.join(os.path.dirname(__file__), "secrets", "contacts.yml")
 
 LABEL_NAMES = {
     "DELETE":    "1-ToDelete",
@@ -61,6 +61,13 @@ def clean_text(text_body):
     if not text_body:
         return ""
     soup = BeautifulSoup(text_body, "html.parser")
+    # get_text() does NOT skip <style>/<script> content by default — without
+    # this, HTML emails with large inline CSS blocks (common in bank/marketing
+    # templates) dump hundreds of lines of raw CSS as "text" ahead of the
+    # actual message content, burying anything meaningful past any reasonable
+    # truncation length.
+    for tag in soup(["style", "script"]):
+        tag.decompose()
     return soup.get_text(separator="\n").strip()
 
 
@@ -300,7 +307,7 @@ def triage_and_label_emails():
         entry = {"id": msg_ref["id"], "sender": sender, "subject": str(subject)[:60], "decision": None}
         batch_senders.append(entry)
         # Extract body
-        body = ""
+        plain_body = ""
         html_fallback = ""
         if msg.is_multipart():
             for part in msg.walk():
@@ -311,21 +318,59 @@ def triage_and_label_emails():
                     raw_body = part.get_payload(decode=True).decode(errors="ignore")
                 except Exception:
                     continue
-                if ct == "text/plain":
-                    body = clean_text(raw_body)
-                    break
+                if ct == "text/plain" and not plain_body:
+                    plain_body = clean_text(raw_body)
                 elif ct == "text/html" and not html_fallback:
                     html_fallback = clean_text(raw_body)
         else:
             try:
                 raw_body = msg.get_payload(decode=True).decode(errors="ignore")
-                body = clean_text(raw_body)
+                plain_body = clean_text(raw_body)
             except Exception:
-                body = ""
+                plain_body = ""
 
-        if not body.strip():
+        # Many transactional/bill emails (statements, invoices, receipts) ship a
+        # plaintext alternative that LOOKS substantial (unsubscribe boilerplate,
+        # privacy/security links, footer address) but never actually contains
+        # the real numbers — those live only in the HTML version's summary
+        # table. Plaintext length alone is not a reliable signal of substance,
+        # so check for an actual dollar figure: if the HTML has one and the
+        # plaintext doesn't, the HTML is the version worth reading.
+        def _has_dollar_amount(text):
+            return re.search(r'\$[\d,]+\.\d{2}', text) is not None
+
+        MIN_PLAINTEXT_LEN = 150
+        if html_fallback.strip() and _has_dollar_amount(html_fallback) and not _has_dollar_amount(plain_body):
             body = html_fallback
-        body = body[:500]
+        elif len(plain_body.strip()) >= MIN_PLAINTEXT_LEN:
+            body = plain_body
+        elif html_fallback.strip():
+            body = html_fallback
+        else:
+            body = plain_body
+
+        body = body[:1500]
+
+        # Flag emails that contain concrete financial figures (dollar amount +
+        # a balance/due-date keyword) even if their subject sounds like a
+        # routine "your statement is ready" notification — these carry real
+        # actionable info (amount owed, due date) the user needs to see.
+        _financial_keywords = (
+            "balance", "due date", "minimum payment", "amount due",
+            "payment due", "past due", "autopay", "statement balance"
+        )
+        has_financial_detail = (
+            re.search(r'\$[\d,]+\.\d{2}', body) is not None
+            and any(kw in body.lower() for kw in _financial_keywords)
+        )
+        financial_hint = (
+            "IMPORTANT: This email contains a specific dollar amount together with "
+            "a balance/due-date keyword (e.g. a statement balance, minimum payment, "
+            "or payment due date). Even if the subject line sounds like a routine "
+            "'statement is ready' notification, this is ACTIONABLE financial "
+            "information — use ATTENTION, not DELETE."
+            if has_financial_detail else ""
+        )
 
         if trusted_hint:
             print(f"  ✅ Trusted sender — skipping LLM, labelling ATTENTION directly")
@@ -351,6 +396,7 @@ def triage_and_label_emails():
 Be ruthless but practical. Prioritize actionability, personal relevance, and important commitments over generic updates.
 
 {category_hint}
+{financial_hint}
 
 Evaluate the email across three dimensions:
 1. SENDER TYPE: Is it a real person, an automated system, a newsletter, a service notification, or spam?
@@ -358,8 +404,8 @@ Evaluate the email across three dimensions:
 3. RELEVANCE: Is it directly tied to personal life, finances, health, legal matters, or active commitments?
 
 DECISION CRITERIA:
-- Use "ATTENTION" for: personal emails, bills or payment due, appointments or reminders, security alerts, account changes, receipts, medical, tax, legal notices, shipping requiring action, anything with a deadline or requiring a reply.
-- Use "DELETE" for: newsletters, marketing with no expiring offer, social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, generic status updates.
+- Use "ATTENTION" for: personal emails, bills or payment due, appointments or reminders, security alerts, account changes, receipts, medical, tax, legal notices, shipping requiring action, anything with a deadline or requiring a reply. This includes "your statement/bill is now available" emails whenever the body contains a specific balance, amount due, or payment due date — the phrase "statement is ready" is just packaging; the balance and due date inside are what matter.
+- Use "DELETE" for: newsletters, marketing with no expiring offer, social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, generic status updates that contain no dollar amounts, deadlines, or account-specific figures.
 
 [EMAIL CONTENT START]
 From: {sender}

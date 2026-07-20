@@ -13,8 +13,9 @@ SCOPES = [
     "https://www.googleapis.com/auth/gmail.readonly",
     "https://www.googleapis.com/auth/gmail.modify",
 ]
-TOKEN_FILE = "token.json"
-CREDENTIALS_FILE = "credentials.json"
+SECRETS_DIR = os.path.join(os.path.dirname(__file__), "secrets")
+TOKEN_FILE = os.path.join(SECRETS_DIR, "token.json")
+CREDENTIALS_FILE = os.path.join(SECRETS_DIR, "credentials.json")
 
 
 def get_gmail_service():
