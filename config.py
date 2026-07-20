@@ -32,13 +32,24 @@ def get_auth_type():
 # Check if Ollama is running
 import ollama as ollama_client
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "phi4-mini")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
 OLLAMA_CLIENT = ollama_client
 
+# Fallback options for any model not listed in MODEL_CONFIGS below. 4096
+# tokens is comfortably more than the triage prompt needs (instructions +
+# the 1500-char truncated email body come to well under 1500 tokens), so
+# there's no need to give every model its own entry just to set this.
+DEFAULT_MODEL_CONFIG = {
+    "num_ctx": 4096,
+    "format": "json",
+}
+
 # Per-model Ollama options. Set to None to use Ollama defaults for that model.
+# Only add an entry here if a model needs something different from
+# DEFAULT_MODEL_CONFIG (e.g. a bigger context window, tuned temperature/top_p,
+# or think=False for models that support "thinking" mode).
 # Note: think=False is passed as a top-level ollama.chat() param, not here.
 MODEL_CONFIGS = {
-    "qwen2.5:3b-instruct": {"num_ctx": 8192},
     "qwen3.5:4b": { "format": "json",
         "num_ctx": 16384,
         "temperature": 0.5,
@@ -48,21 +59,6 @@ MODEL_CONFIGS = {
         "num_ctx": 16384,
         "temperature": 0.7,
         "top_p": 0.8,
-    },
-    "phi4-mini": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False
-    },
-    "granite4.1:3b": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False
-    },
-    "ministral-3:3b": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False
     },
 }
 
