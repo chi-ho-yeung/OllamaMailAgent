@@ -1,6 +1,6 @@
 # MailAgent — Email Triage Agent
 
-Automatically triages your Gmail inbox using a local LLM (Qwen 3.5 via Ollama).
+Automatically triages your Gmail inbox using a local LLM (Qwen 2.5 via Ollama).
 Runs in batches, labels emails, and gives you the option to move marked emails to Trash.
 
 ---
@@ -21,7 +21,7 @@ larger and messier your inbox, the more time this saves.
 
 Small models (2–4B parameters) turn out to be well-suited for this task. Triage does
 not require deep reasoning — it requires pattern recognition, tone detection, and
-judgment about urgency. A 2B model running locally at ~23s per email is fast enough
+judgment about urgency. A 3B model running locally at ~10s per email is fast enough
 to clear a backlog overnight and is more than capable of making correct calls on
 newsletters, bills, appointments, and spam.
 
@@ -182,7 +182,7 @@ GOOGLE_CLIENT_SECRET=your-client-secret
 
 # Optional: override Ollama defaults
 OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=qwen3.5:2b
+OLLAMA_MODEL=qwen2.5:3b-instruct
 
 # Optional: path to labels config (default: config/labels.json)
 LABELS_PATH=config/labels.json
@@ -234,7 +234,7 @@ All settings live in `config.py` and `.env`:
 | Setting        | Description                                     |
 |----------------|-------------------------------------------------|
 | `EMAIL_ACCOUNT`| Gmail address to process                        |
-| `OLLAMA_MODEL` | Model name (default: `qwen3.5:2b`, recommended) |
+| `OLLAMA_MODEL` | Model name (default: `qwen2.5:3b-instruct`, recommended) |
 | `OLLAMA_HOST`  | Ollama server URL                               |
 
 Batch size (emails per run) is set in `mailagent.py`:
@@ -298,55 +298,25 @@ Press **Ctrl+C** at any time to stop cleanly between emails.
 
 ### Model Performance
 
-`qwen3.5:2b` is the recommended default — it produces accurate triage decisions and
-runs about 3× faster than the 4b variant, making it a good fit for most laptops.
-To switch models, update `OLLAMA_MODEL` in your `.env`.
+`qwen2.5:3b-instruct` is the recommended default — it produces accurate triage
+decisions with no thinking-mode overhead, making it both fast and predictable
+on modest hardware. To switch models, update `OLLAMA_MODEL` in your `.env`.
 
 | Model                  | Avg. inference time | Thinking mode | Notes                             |
 |------------------------|--------------------:|:-------------:|-----------------------------------|
-| `qwen3.5:2b` ✅        | ~23s                | Suppressed    | **Recommended default.** Fast and accurate |
+| `qwen2.5:3b-instruct` ✅ | ~10s               | None          | **Recommended default.** No thinking mode, very fast |
+| `qwen3.5:2b`           | ~23s                | Suppressed    | Fast and accurate                  |
 | `qwen3.5:4b`           | ~60–70s             | Suppressed    | More powerful hardware recommended |
-| `qwen2.5:3b-instruct`  | ~10s                | None          | No thinking mode, very fast        |
-| `phi4-mini`            | ~15s                | Suppressed    | Microsoft model, compact and capable |
-| `granite4.1:3b`        | ~12s                | Suppressed    | IBM Granite, strong instruction following |
-| `ministral-3:3b`       | ~10s                | Suppressed    | Mistral's 3B, fast and efficient   |
+| `phi4-mini`            | ~15s                | None          | Microsoft model, compact and capable |
+| `granite4.1:3b`        | ~12s                | None          | IBM Granite, strong instruction following |
+| `ministral-3:3b`       | ~10s                | None          | Mistral's 3B, fast and efficient   |
+| `liquidai/lfm2.5-1.2b-instruct:latest` | ~5s | None          | Liquid AI's 1.2B, smallest option tried |
 
 ### Per-Model Configuration
 
-Each model can have its own `options` block (or none at all) defined in `config.py`:
-
-```python
-MODEL_CONFIGS = {
-    "qwen2.5:3b-instruct": {"num_ctx": 8192},
-    "qwen3.5:4b": {
-        "format": "json",
-        "num_ctx": 16384,
-        "temperature": 0.5,
-        "top_p": 0.8,
-    },
-    "qwen3.5:2b": {
-        "format": "json",
-        "num_ctx": 16384,
-        "temperature": 0.7,
-        "top_p": 0.8,
-    },
-    "phi4-mini": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False,
-    },
-    "granite4.1:3b": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False,
-    },
-    "ministral-3:3b": {
-        "num_ctx": 16384,
-        "format": "json",
-        "think": False,
-    },
-}
-```
+Each model can have its own `options` block, or none at all — see `MODEL_CONFIGS`
+(and the `DEFAULT_MODEL_CONFIG` fallback used for any model not listed there)
+in `config.py`.
 
 `temperature` and `top_p` values are Qwen's recommended defaults for non-thinking
 mode. Adjust to tune creativity vs. consistency. Models without thinking mode

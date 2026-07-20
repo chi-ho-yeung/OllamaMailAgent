@@ -23,8 +23,15 @@ import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from email.header import decode_header
-from config import EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS
+from config import EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS, DEFAULT_MODEL_CONFIG
 from refresh_oauth_token import get_gmail_service
+from relevancy_prompt import (
+    USER_LANGUAGES,
+    VALID_DECISIONS,
+    get_category_hint,
+    get_financial_hint,
+    build_triage_prompt,
+)
 from bs4 import BeautifulSoup
 
 BATCH_SIZE = 10  # Number of oldest untagged emails to process per run
@@ -274,21 +281,8 @@ def triage_and_label_emails():
         # Simplify date: remove time portion (e.g. Wed, 20 May 2026 21:26:42 +0000 -> Wed, 20 May 2026)
         date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
 
-        # Map Gmail category labels to human-readable hints
-        CATEGORY_MAP = {
-            "CATEGORY_PROMOTIONS": ("Promotions", "Lean DELETE — but use ATTENTION if there is a limited-time offer, expiring deal, or discount that may be genuinely useful."),
-            "CATEGORY_SOCIAL":     ("Social",     "Lean DELETE — social media notifications rarely need action."),
-            "CATEGORY_UPDATES":    ("Updates",    "Neutral — could go either way. Use ATTENTION for: appointments, bill due dates, payment confirmations, security alerts, account changes, shipping with action needed, or any deadline. Use DELETE for: generic digests, read receipts, routine status updates with no action required."),
-            "CATEGORY_FORUMS":     ("Forums",     "Lean DELETE — forum digests are rarely urgent."),
-            "CATEGORY_PERSONAL":   ("Personal",   "Lean ATTENTION — likely from a real person or a service tied to personal commitments."),
-        }
-        gmail_category = None
-        category_hint = ""
-        for label_id, (label_name, hint_text) in CATEGORY_MAP.items():
-            if label_id in gmail_labels:
-                gmail_category = label_name
-                category_hint = f"Gmail category: '{label_name}'. {hint_text}"
-                break
+        # Map Gmail category labels to human-readable hints (logic lives in relevancy_prompt.py)
+        gmail_category, category_hint = get_category_hint(gmail_labels)
 
         _, sender_addr = parse_sender(sender)
         trusted_hint = (
@@ -355,22 +349,8 @@ def triage_and_label_emails():
         # a balance/due-date keyword) even if their subject sounds like a
         # routine "your statement is ready" notification — these carry real
         # actionable info (amount owed, due date) the user needs to see.
-        _financial_keywords = (
-            "balance", "due date", "minimum payment", "amount due",
-            "payment due", "past due", "autopay", "statement balance"
-        )
-        has_financial_detail = (
-            re.search(r'\$[\d,]+\.\d{2}', body) is not None
-            and any(kw in body.lower() for kw in _financial_keywords)
-        )
-        financial_hint = (
-            "IMPORTANT: This email contains a specific dollar amount together with "
-            "a balance/due-date keyword (e.g. a statement balance, minimum payment, "
-            "or payment due date). Even if the subject line sounds like a routine "
-            "'statement is ready' notification, this is ACTIONABLE financial "
-            "information — use ATTENTION, not DELETE."
-            if has_financial_detail else ""
-        )
+        # (logic lives in relevancy_prompt.py)
+        has_financial_detail, financial_hint = get_financial_hint(body)
 
         if trusted_hint:
             print(f"  ✅ Trusted sender — skipping LLM, labelling ATTENTION directly")
@@ -389,40 +369,16 @@ def triage_and_label_emails():
             print("-" * 60)
             continue
 
-        # Triage prompt — only DELETE and ATTENTION are valid LLM outputs; ERROR is reserved for processing failures
-        valid_keys_list = ["DELETE", "ATTENTION"]
-        prompt = f"""You are an advanced AI email triage assistant. Analyze the email below and decide whether it needs attention or should be deleted.
-
-Be ruthless but practical. Prioritize actionability, personal relevance, and important commitments over generic updates.
-
-{category_hint}
-{financial_hint}
-
-Evaluate the email across three dimensions:
-1. SENDER TYPE: Is it a real person, an automated system, a newsletter, a service notification, or spam?
-2. URGENCY & ACTION: Does it require a reply, an action, or has a deadline? Or is it purely informational/promotional?
-3. RELEVANCE: Is it directly tied to personal life, finances, health, legal matters, or active commitments?
-
-DECISION CRITERIA:
-- Use "ATTENTION" for: personal emails, bills or payment due, appointments or reminders, security alerts, account changes, receipts, medical, tax, legal notices, shipping requiring action, anything with a deadline or requiring a reply. This includes "your statement/bill is now available" emails whenever the body contains a specific balance, amount due, or payment due date — the phrase "statement is ready" is just packaging; the balance and due date inside are what matter.
-- Use "DELETE" for: newsletters, marketing with no expiring offer, social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, generic status updates that contain no dollar amounts, deadlines, or account-specific figures.
-
-[EMAIL CONTENT START]
-From: {sender}
-Date: {date}
-Subject: {subject}
-Body: {body.strip()}
-[EMAIL CONTENT END]
-
-IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
-{{
-  "decision": "{valid_keys_list[0]}" or "{valid_keys_list[1]}",
-  "summary": "1 sentence summary",
-  "sender_type": "string",
-  "action_required": "string",
-  "relevance_score": 1-5,
-  "reason": "explanation"
-}}"""
+        # Triage prompt — built in relevancy_prompt.py (only DELETE and ATTENTION
+        # are valid LLM outputs; ERROR is reserved for processing failures)
+        prompt = build_triage_prompt(
+            sender=sender,
+            date=date,
+            subject=subject,
+            body=body,
+            category_hint=category_hint,
+            financial_hint=financial_hint,
+        )
 
         # Run Ollama
         ai_start = time.time()
@@ -432,8 +388,9 @@ IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text,
                 "messages": [{"role": "user", "content": prompt}],
             }
             
-            # Use the model's specific config
-            model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, {}).copy()
+            # Use the model's specific config, falling back to DEFAULT_MODEL_CONFIG
+            # (num_ctx=8192, format=json) for any model not explicitly listed
+            model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
             
             # "format" is a top-level parameter in ollama.chat
             if "format" in model_options:
@@ -482,7 +439,7 @@ IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text,
         ai_times.append(elapsed)
 
         # Parse decision — strip <think>...</think> blocks Qwen3 thinking mode emits
-        valid_decisions = ["DELETE", "ATTENTION"]
+        valid_decisions = VALID_DECISIONS
         try:
             clean_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
             clean_response = re.sub(r"^```(?:json)?", "", clean_response).strip()
@@ -494,13 +451,26 @@ IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text,
             sender_type = result.get("sender_type", "Unknown")
             action_required = result.get("action_required", "None")
             relevance_score = result.get("relevance_score", "?")
+            detected_language = result.get("detected_language", "").strip()
+            translated_subject = result.get("translated_subject", "").strip()
         except Exception:
             decision = "ERROR"
             summary = ""
             reason = f"Could not parse model response. Raw: {response_text[:120]!r}"
             sender_type = action_required = "Unknown"
             relevance_score = "?"
+            detected_language = ""
+            translated_subject = ""
             metrics["ERROR_FALLBACK"] += 1
+
+        # If the email wasn't in a language the user reads, surface the
+        # translated subject so they're not left guessing what it said.
+        is_foreign_language = bool(detected_language) and detected_language not in USER_LANGUAGES
+        if is_foreign_language:
+            lang_note = f"🌐 Detected language: {detected_language}"
+            if translated_subject:
+                lang_note += f" | Translated subject: {translated_subject}"
+            print(f"  {lang_note}")
 
         if decision not in valid_decisions:
             decision = "ERROR"
