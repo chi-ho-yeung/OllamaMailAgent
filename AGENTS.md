@@ -38,7 +38,7 @@ this project deliberately avoids.
 |---|---|
 | `mailAgent.py` | Entry point and main loop. Gmail fetch/label/trash, body extraction, Ollama call, post-batch menu. **Note capital A** — the file is `mailAgent.py`, not `mailagent.py`. |
 | `relevancy_prompt.py` | All prompt-construction logic: the triage prompt template, Gmail-category hints, financial-detail detection (`BILL_KEYWORDS` for owed money vs. `ACCOUNT_ACTIVITY_KEYWORDS` for money that already moved — see gotchas below), valid decision list. Edit this file to change triage behavior/wording. |
-| `config.py` | Loads `secrets/.env`, exposes `EMAIL_ACCOUNT`, `OLLAMA_MODEL`, `OLLAMA_HOST`, `MODEL_CONFIGS`/`DEFAULT_MODEL_CONFIG` (per-model Ollama options), and Gmail OAuth config helpers. Runs an Ollama connectivity check and prints status on import — importing this module has side effects (prints to stdout). |
+| `config.py` | Loads `secrets/.env`, exposes `EMAIL_ACCOUNT`, `OLLAMA_MODEL`, `OLLAMA_HOST`, `MODEL_CONFIGS`/`DEFAULT_MODEL_CONFIG` (per-model Ollama options). No OAuth client-id/secret handling lives here — that's entirely `secrets/credentials.json` + `secrets/token.json` via `refresh_oauth_token.py`. Runs an Ollama connectivity check and prints status on import — importing this module has side effects (prints to stdout). |
 | `refresh_oauth_token.py` | `get_gmail_service()` — loads/refreshes/creates the OAuth token, returns an authorized Gmail API client. Run standalone to (re)authenticate. |
 | `requirements.txt` | Python deps: `beautifulsoup4`, `google-api-python-client`, `google-auth*`, `ollama`, `python-dotenv`, `pyyaml`. |
 | `README.md` | Full project docs: goals, architecture rationale, label table, setup steps, usage example output, model benchmark table. |

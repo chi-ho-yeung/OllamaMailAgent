@@ -176,10 +176,6 @@ Create a `.env` file in the project root:
 # Gmail address to process
 EMAIL_ACCOUNT=you@gmail.com
 
-# OAuth 2.0 credentials (from Google Cloud Console — see README_AUTH.md)
-GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=your-client-secret
-
 # Optional: override Ollama defaults
 OLLAMA_HOST=http://localhost:11434
 OLLAMA_MODEL=qwen2.5:3b-instruct
@@ -188,8 +184,8 @@ OLLAMA_MODEL=qwen2.5:3b-instruct
 LABELS_PATH=config/labels.json
 ```
 
-See [README_AUTH.md](README_AUTH.md) for how to obtain `GOOGLE_CLIENT_ID` and
-`GOOGLE_CLIENT_SECRET` from the Google Cloud Console.
+No client ID/secret env vars are needed — they're embedded in `credentials.json`
+(see step 2 below and [README_AUTH.md](README_AUTH.md)).
 
 ### 2. `credentials.json` — Google OAuth client config
 
