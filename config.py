@@ -12,8 +12,12 @@ SECRETS_DIR = Path(__file__).parent / "secrets"
 load_dotenv(SECRETS_DIR / ".env")
 
 # ============================================
-# AUTHENTICATION (OAuth 2.0)
-# ============================================
+# AUTHENTICATION
+# Credentials come from Google's credential store, loaded by refresh_oauth_token.py.
+# The credentials.json + token.json pattern is the only one we need — no separate
+# env-client-id/env-client-secret path required. This makes the flow simpler:
+#   1. First run: OAuth consent → creates both .json files under secrets/
+#   2. Subsequent runs: refresh_oauth_token.py loads/refreshes them automatically
 
 # OAuth 2.0 Credentials
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
