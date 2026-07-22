@@ -2,7 +2,9 @@
 
 ## Quick Start
 
-MailAgent authenticates via **OAuth 2.0** using credentials stored in your `.env` file.
+MailAgent authenticates via **OAuth 2.0** using `secrets/credentials.json`
+(downloaded from Google Cloud Console) and an auto-managed `secrets/token.json`.
+No client ID/secret env vars are required.
 
 ---
 
@@ -29,16 +31,18 @@ MailAgent authenticates via **OAuth 2.0** using credentials stored in your `.env
    - Click "Create Credentials" → "OAuth client ID"
    - Choose "Desktop app" as application type
    - Click "Create"
-   - **Download the JSON file** → Save locally
+   - **Download the JSON file** → Save as `secrets/credentials.json`
 
-### Step 2: Configure Environment
+### Step 2: Set your Gmail address
 
-Edit `.env` with your OAuth credentials:
+Edit `.env` with the account to process:
 
 ```env
-GOOGLE_CLIENT_ID=your-client-id.apps.googleusercontent.com
-GOOGLE_CLIENT_SECRET=your-client-secret-from-json-file
+EMAIL_ACCOUNT=you@gmail.com
 ```
+
+No client ID/secret env vars are needed — `refresh_oauth_token.py` reads them
+directly from `secrets/credentials.json`.
 
 ### Step 3: (Optional) Create Service Account
 
