@@ -42,14 +42,9 @@ this project deliberately avoids.
 | `refresh_oauth_token.py` | `get_gmail_service()` — loads/refreshes/creates the OAuth token, returns an authorized Gmail API client. Run standalone to (re)authenticate. |
 | `requirements.txt` | Python deps: `beautifulsoup4`, `google-api-python-client`, `google-auth*`, `ollama`, `python-dotenv`, `pyyaml`. |
 | `README.md` | Full project docs: goals, architecture rationale, label table, setup steps, usage example output, model benchmark table. |
-| `README_AUTH.md`, `OAUTH_SETUP.md` | Gmail OAuth setup walkthroughs (Google Cloud Console steps). `README_AUTH.md` is the current/complete one. |
+| `OAUTH_SETUP.md` | Gmail OAuth setup guide (Google Cloud Console steps). |
 | `secrets/` | **Gitignored.** Holds `.env`, `credentials.json`, `token.json`, `contacts.yml`. Never read/print/commit these; treat as opaque local state. |
 | `config/labels.json` | Not present by default — user-created, gitignored (see `.gitignore`: `config/`). Maps label keys to Gmail label names. |
-
-There is no `main.py` despite what `README_AUTH.md` says to run — the real
-entry point is `python mailAgent.py`. `README_AUTH.md` has a couple of stale
-references (`main.py`, `.token_cache`); trust `mailAgent.py`/`refresh_oauth_token.py`
-source over that doc when they conflict.
 
 ## How the pieces connect (call graph)
 

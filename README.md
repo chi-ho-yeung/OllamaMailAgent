@@ -152,7 +152,7 @@ To add or rename categories, edit only the `LABEL_NAMES` dict — everything els
 
 - Python 3.x
 - [Ollama](https://ollama.com/) running locally with your chosen model pulled (see [LLM Settings](#llm-settings))
-- Gmail API credentials (see [README_AUTH.md](README_AUTH.md))
+- Gmail API credentials (see [OAUTH_SETUP.md](OAUTH_SETUP.md))
 
 Install Python dependencies:
 
@@ -185,14 +185,14 @@ LABELS_PATH=config/labels.json
 ```
 
 No client ID/secret env vars are needed — they're embedded in `credentials.json`
-(see step 2 below and [README_AUTH.md](README_AUTH.md)).
+(see step 2 below and [OAUTH_SETUP.md](OAUTH_SETUP.md)).
 
 ### 2. `credentials.json` — Google OAuth client config
 
 Download this file from the Google Cloud Console after creating an OAuth 2.0
 client ID (Desktop app type). Save it as `credentials.json` in the project root.
 
-Full instructions: [README_AUTH.md](README_AUTH.md) → Step 1.
+Full instructions: [OAUTH_SETUP.md](OAUTH_SETUP.md) → Step 1.
 
 ### 3. `token.json` and `.token_cache` — OAuth tokens
 
@@ -367,12 +367,11 @@ mailagent/
 ├── credentials.json      # Google OAuth client config (not committed — see Setup)
 ├── token.json            # OAuth token (auto-managed, not committed)
 ├── README.md             # This file
-├── README_AUTH.md        # Gmail OAuth setup guide
-└── OAUTH_SETUP.md        # Additional OAuth notes
+└── OAUTH_SETUP.md        # Gmail OAuth setup guide
 ```
 
 ---
 
 ## Authentication
 
-See [README_AUTH.md](README_AUTH.md) for the full Gmail OAuth 2.0 setup guide.
+See [OAUTH_SETUP.md](OAUTH_SETUP.md) for the full Gmail OAuth 2.0 setup guide.
