@@ -190,18 +190,12 @@ def fetch_untagged_emails(service, label_ids, batch_size):
 
 
 def triage_and_label_emails():
-    print("=" * 60)
-    print("EMAIL CLEANUP AGENT - TRIER MODE")
-    print("=" * 60)
-    print(f"Gmail Account: {EMAIL_ACCOUNT}")
-    print(f"Ollama Model: {OLLAMA_MODEL} ({OLLAMA_HOST})")
     print("=" * 60 + "\n")
 
     # Connect to Gmail API
     try:
-        print("Connecting to Gmail API...")
         service = get_gmail_service()
-        print("✓ Gmail connected (OAuth 2.0)")
+        print(f"✓ Gmail API connected ({EMAIL_ACCOUNT})")
     except FileNotFoundError as e:
         print(f"❌ {e}")
         return
@@ -209,15 +203,30 @@ def triage_and_label_emails():
         print(f"❌ Failed to connect to Gmail: {e}")
         return
 
-    # Check Ollama
+    # Check Ollama & force cold start
     try:
         available = ollama_client.list()
         if not available.get("models"):
             print("⚠️  No Ollama models available")
             return
-        print("✓ Model ready")
+
+        print("Warming up model (cold start)...")
+        chat_kwargs = {
+            "model": OLLAMA_MODEL,
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": False,
+        }
+        model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
+        if "think" in model_options:
+            chat_kwargs["think"] = model_options.pop("think")
+        model_options.pop("format", None)
+        if model_options:
+            chat_kwargs["options"] = model_options
+
+        ollama_client.chat(**chat_kwargs)
+        print("✓ Model warmed up {OLLAMA_MODEL} ({OLLAMA_HOST}")
     except Exception as e:
-        print(f"⚠️  Ollama unavailable: {e}")
+        print(f"⚠️  Ollama unavailable or warmup failed: {e}")
         return
 
     # Ensure triage labels exist

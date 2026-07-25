@@ -158,69 +158,6 @@ Install Python dependencies:
 
 ```bash
 pip install -r requirements.txt
-```
-
----
-
-## Setup
-
-Several files required to run MailAgent are excluded from the repository because
-they contain credentials or runtime state. You must create them locally before
-running the agent.
-
-### 1. `.env` — credentials and settings
-
-Create a `.env` file in the project root:
-
-```env
-# Gmail address to process
-EMAIL_ACCOUNT=you@gmail.com
-
-# Optional: override Ollama defaults
-OLLAMA_HOST=http://localhost:11434
-OLLAMA_MODEL=qwen2.5:3b-instruct
-
-# Optional: path to labels config (default: config/labels.json)
-LABELS_PATH=config/labels.json
-```
-
-No client ID/secret env vars are needed — they're embedded in `credentials.json`
-(see step 2 below and [OAUTH_SETUP.md](OAUTH_SETUP.md)).
-
-### 2. `credentials.json` — Google OAuth client config
-
-Download this file from the Google Cloud Console after creating an OAuth 2.0
-client ID (Desktop app type). Save it as `credentials.json` in the project root.
-
-Full instructions: [OAUTH_SETUP.md](OAUTH_SETUP.md) → Step 1.
-
-### 3. `token.json` and `.token_cache` — OAuth tokens
-
-These are generated automatically the first time you run the agent or
-`refresh_oauth_token.py`. You do not need to create them manually:
-
-```bash
-python refresh_oauth_token.py
-```
-
-A browser window will open for you to log in and grant Gmail access. The token
-is saved locally and refreshed automatically on subsequent runs.
-
-### 4. `config/labels.json` — Gmail label definitions
-
-Create a `config/` directory and add a `labels.json` file that defines the Gmail
-labels the agent will create and apply. Minimal example matching the defaults:
-
-```json
-{
-  "DELETE": "1-ToDelete",
-  "ATTENTION": "1-NeedAttention"
-}
-```
-
-The keys must match the `LABEL_NAMES` dict in `mailagent.py`. Labels are created
-in your Gmail account automatically on first run if they don't already exist.
-
 ---
 
 ## Configuration
@@ -358,20 +295,56 @@ clean = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip(
 
 ```
 mailagent/
-├── mailagent.py          # Main agent
-├── config.py             # Model and account settings
-├── refresh_oauth_token.py# OAuth token management
-├── requirements.txt      # Python dependencies
-├── contacts.yml          # Trusted senders (auto-created, not committed)
-├── .env                  # Credentials (not committed — see Setup)
-├── credentials.json      # Google OAuth client config (not committed — see Setup)
-├── token.json            # OAuth token (auto-managed, not committed)
-├── README.md             # This file
-└── OAUTH_SETUP.md        # Gmail OAuth setup guide
+├── mailagent.py              # Main agent
+├── config.py                 # Model and account settings
+├── refresh_oauth_token.py   # OAuth token management
+├── relevancy_prompt.py       # Triage prompt logic
+├── requirements.txt          # Python dependencies
+├── README.md                 # This file
+├── OAUTH_SETUP.md            # Gmail OAuth setup guide
+├── secrets/                  # Gitignored — all credentials here
+│   ├── .env                  # EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST
+│   ├── credentials.json     # Google OAuth client ID/secret
+│   ├── token.json           # Auto-generated OAuth token
+│   └── contacts.yml          # Trusted senders (auto-created)
+└── config/                   # Gitignored — user config
+    └── labels.json          # Optional label mappings
 ```
 
 ---
 
-## Authentication
+## Setup
+
+### 1. Install dependencies
+
+```bash
+pip install -r requirements.txt --break-system-packages
+```
+
+### 2. Create secrets directory
+
+```bash
+mkdir secrets
+```
+
+### 3. Configure environment
+
+Create `secrets/.env` with:
+
+```
+EMAIL_ACCOUNT=your-email@gmail.com
+OLLAMA_MODEL=qwen2.5:3b-instruct
+OLLAMA_HOST=http://localhost:11434
+```
+
+### 4. Set up Gmail OAuth
 
 See [OAUTH_SETUP.md](OAUTH_SETUP.md) for the full Gmail OAuth 2.0 setup guide.
+
+### 5. Run
+
+```bash
+python mailagent.py
+```
+
+On first run, it will open a browser for OAuth consent and create `secrets/token.json` automatically.
