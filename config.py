@@ -72,12 +72,10 @@ LABELS_PATH = os.getenv("LABELS_PATH", "config/labels.json")
 IMAP_SERVER = "imap.gmail.com"
 IMAP_PORT = 993
 
-# Print configuration summary
-if EMAIL_ACCOUNT:
-    print(f"✅ Gmail account: {EMAIL_ACCOUNT}")
-else:
+if not EMAIL_ACCOUNT:
     print("⚠️  WARNING: EMAIL_ACCOUNT not set in secrets/.env")
-print("  Auth: secrets/credentials.json + secrets/token.json (see refresh_oauth_token.py)")
+
+
 
 # ============================================
 # End of Authentication Configuration

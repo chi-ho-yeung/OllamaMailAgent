@@ -11,6 +11,7 @@ tested, or swapped independently of the Gmail/Ollama plumbing.
 ================================================================================
 """
 import re
+from datetime import datetime
 
 # Gmail category label -> (human-readable name, short triage lean).
 # Kept intentionally brief: the full ATTENTION/DELETE criteria live once, in
@@ -89,7 +90,8 @@ def get_financial_hint(body):
     return (is_bill or is_activity), hint
 
 
-def build_triage_prompt(sender, date, subject, body, category_hint="", financial_hint=""):
+def build_triage_prompt(sender, date, subject, body, category_hint=" ", financial_hint=""):
+    today_now = datetime.now().strftime("%Y-%m-%d")
     languages_str = " or ".join(USER_LANGUAGES)
     prompt = f"""You are an advanced AI email triage assistant. Analyze the email below and decide whether it needs attention or should be deleted.
 
@@ -100,20 +102,21 @@ Prioritize actionability, personal relevance, and important account/financial/le
 
 Evaluate the email across three dimensions:
 1. SENDER TYPE: A real person, an automated system, a newsletter, a service notification, or spam?
-2. URGENCY & ACTION: Does it require a reply or action, or have a deadline? Or is it purely informational/promotional?
-3. RELEVANCE: Is it tied to personal life, finances, health, legal matters, or active commitments — even if no action is needed?
+2. URGENCY & ACTION: Does it require a reply or action, or have a deadline? (Compare Message Date vs Current Date — if a deadline or limited-time offer has already passed, it is no longer actionable).
+3. RELEVANCE: Is it tied to personal life, finances, health, legal matters, or active commitments — even if no action is needed? (Note: The older an email is relative to today, the lower its ongoing relevance or actionability — except for historical financial/tax/legal records, statements, or receipts which retain archiving value).
 
 LANGUAGE HANDLING: The user only reads {languages_str}. Base the triage decision on the email's actual content regardless of language — never default to DELETE or ATTENTION merely because the language is unfamiliar. Always write "summary" and "reason" IN ENGLISH. Set "detected_language" to the language the email is written in. Set "translated_subject" to an English translation of the subject if it is not already in {languages_str}, otherwise leave it as an empty string.
 
 DECISION CRITERIA:
 - Use "ATTENTION" for: personal emails, bills or payments due, appointments or reminders, security alerts, account changes, receipts, medical/tax/legal notices, shipping requiring action, anything with a deadline or requiring a reply — AND, importantly, any email reporting a specific dollar amount tied to a real account event (a transfer, deposit, withdrawal, or payment made/received), even when nothing needs to be done. Information about money that actually moved in an account is ATTENTION-worthy purely because it happened, not because it's actionable.
-- Use "DELETE" for: newsletters, marketing with no expiring offer, social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, and generic status updates that contain no dollar amounts, deadlines, or account-specific figures.
+- Use "DELETE" for: newsletters, marketing with no expiring offer, expired promotions or deals where the deadline has passed relative to Current Date (Today), social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, and generic status updates that contain no dollar amounts, deadlines, or account-specific figures.
 
 PRIORITY WHEN SIGNALS CONFLICT: If the Gmail category hint above suggests one lean but the email's actual content matches an ATTENTION case in DECISION CRITERIA (especially a financial-detail hint above), the content-based DECISION CRITERIA always wins — category hints are defaults, not overrides.
 
 [EMAIL CONTENT START]
 From: {sender}
-Date: {date}
+Message Date: {date}
+Current Date (Today): {today_now}
 Subject: {subject}
 Body: {body.strip()}
 [EMAIL CONTENT END]
