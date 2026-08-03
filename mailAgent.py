@@ -224,7 +224,7 @@ def triage_and_label_emails():
             chat_kwargs["options"] = model_options
 
         ollama_client.chat(**chat_kwargs)
-        print("✓ Model warmed up {OLLAMA_MODEL} ({OLLAMA_HOST}")
+        print(f"✓ Model warmed up {OLLAMA_MODEL} ({OLLAMA_HOST})")
     except Exception as e:
         print(f"⚠️  Ollama unavailable or warmup failed: {e}")
         return
