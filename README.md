@@ -107,7 +107,7 @@ Once enough corrections accumulate, they can be used to:
 2. Connect to local Ollama instance, verify model is loaded
 3. Create triage labels in Gmail if they don't exist yet
 4. Find the 10 oldest inbox emails not yet labelled by this agent
-5. For each email:
+5. For each email, print one compact progress line as it finishes:
      - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip LLM
      - Otherwise extract subject, sender, date, body, and Gmail category hint
      - Ask the LLM to decide: DELETE or ATTENTION, with highlights and action
@@ -116,11 +116,14 @@ Once enough corrections accumulate, they can be used to:
        · ATTENTION → label applied, stays in INBOX
        · ERROR     → label applied, stays in INBOX for manual review
 6. Print a batch performance report
-7. Post-batch menu:
+7. Print full Detailed Results — every email processed, grouped
+   1-NeedAttention → 1-ProcessError → 1-ToDelete, sorted by relevance score
+   within each group (message numbers reflect this order, not processing order)
+8. Post-batch menu:
      1  Run another batch
      2  Move marked emails to Trash (with confirmation)
-     3  Add a sender to the trusted contact list
-     4  Correct a label (flip DELETE ↔ ATTENTION)
+     3  Add a sender to the trusted contact list (same grouped order/numbering as step 7)
+     4  Correct a label (flip DELETE ↔ ATTENTION, same grouped order/numbering as step 7)
      x  Exit
 ```
 
@@ -184,23 +187,14 @@ BATCH_SIZE = 10
 python mailagent.py
 ```
 
-The agent processes each email and prints a per-email summary, then shows a
-performance report and the post-batch menu:
+The agent prints one compact progress line per email as it's processed, then a
+performance report, a full Detailed Results breakdown, and the post-batch menu:
 
 ```
-[2/10] [Updates] From: "Amazon.com" <auto-confirm@amazon.com>
-  📅 Tue, 19 May 2026 | 📝 Ordered: "FUMAX Shower Door Hooks 10..."
-  🗑️ 1-ToDelete | ⏱ 26.9s | 📊 Rel: 1/5
-  💬 Amazon shipping confirmation for a non-actionable, already-delivered order.
-  💡 Routine delivery confirmation with no deadlines or follow-up action needed.
-------------------------------------------------------------
-
-[3/10] [Personal] From: billing@acme.com
-  📅 Thu, 29 May 2026 | 📝 Your invoice #4821 is ready
-  👁️ 1-NeedAttention | ⏱ 21.3s | 📊 Rel: 4/5
-  💬 Invoice #4821 for $149.00 due June 5 with PDF attached.
-  💡 Bill with a deadline requiring action — kept in inbox.
-------------------------------------------------------------
+[1/10] [Promotions] From: "Citi Double Cash® Card" <citicards@e... | 📅 Wed, 29 Jul 2026 | 📝 Grow your portfolio your way | ⏱ 4.5s
+[2/10] [Updates] From: "Amazon.com" <auto-confirm@amazon.com> | 📅 Tue, 19 May 2026 | 📝 Ordered: "FUMAX Shower Door Hooks 10..." | ⏱ 26.9s
+[3/10] [Personal] From: billing@acme.com | 📅 Thu, 29 May 2026 | 📝 Your invoice #4821 is ready | ⏱ 21.3s
+...
 
 ========================================
       BATCH PERFORMANCE REPORT
@@ -212,6 +206,33 @@ Emails Processed : 10
 Avg Inference    : 22.1s
 Total Time       : 132.6s
 ========================================
+========================================
+      DETAILED RESULTS
+========================================
+
+──────────── 1-NeedAttention ────────────
+[1/10] [Personal] From: billing@acme.com
+  📅 Thu, 29 May 2026 | 📝 Your invoice #4821 is ready
+  👁️ 1-NeedAttention | ⏱ 21.3s | 📊 Rel: 4/5
+  💬 Invoice #4821 for $149.00 due June 5 with PDF attached.
+  💡 Bill with a deadline requiring action — kept in inbox.
+------------------------------------------------------------
+
+──────────── 1-ProcessError ────────────
+[4/10] From: some-sender@example.com
+  📅 Mon, 27 Jul 2026 | 📝 A subject the model couldn't parse
+  ⚙️ 1-ProcessError | ⏱ 18.2s | 📊 Rel: ?/5
+  💡 Could not parse model response.
+------------------------------------------------------------
+
+──────────── 1-ToDelete ────────────
+[5/10] [Updates] From: "Amazon.com" <auto-confirm@amazon.com>
+  📅 Tue, 19 May 2026 | 📝 Ordered: "FUMAX Shower Door Hooks 10..."
+  🗑️ 1-ToDelete | ⏱ 26.9s | 📊 Rel: 1/5
+  💬 Amazon shipping confirmation for a non-actionable, already-delivered order.
+  💡 Routine delivery confirmation with no deadlines or follow-up action needed.
+------------------------------------------------------------
+...
 
 What would you like to do?
   1  Run another batch
@@ -222,6 +243,11 @@ What would you like to do?
 
 >
 ```
+
+Message numbers in the Detailed Results section (and in menu options 3 and 4)
+reflect this grouped/sorted display order — `1-NeedAttention` first, then
+`1-ProcessError`, then `1-ToDelete`, sorted by relevance score within each
+group — not the order emails were originally processed.
 
 Press **Ctrl+C** at any time to stop cleanly between emails.
 
