@@ -54,6 +54,15 @@ def _sigint_handler(sig, frame):
 signal.signal(signal.SIGINT, _sigint_handler)
 
 
+def print_progress(index, total, entry):
+    """Compact single-line progress indicator printed once a message finishes processing."""
+    cat_str = f"[{entry['category']}] " if entry.get("category") else ""
+    max_sender_len = max(30, 55 - len(cat_str))
+    elapsed = entry.get("elapsed")
+    elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "skip"
+    print(f"[{index}/{total}] {cat_str}From: {entry['sender'][:max_sender_len]} | 📅 {entry['date']} | 📝 {entry['subject'][:40]} | ⏱ {elapsed_str}")
+
+
 def call_with_timeout(fn, *args, timeout=30, **kwargs):
     """Run fn(*args, **kwargs) in a thread. Raises TimeoutError or re-raises exceptions."""
     with ThreadPoolExecutor(max_workers=1) as executor:
@@ -299,15 +308,21 @@ def triage_and_label_emails():
             if sender_addr.lower() in trusted else ""
         )
 
-        cat_str = f"[{gmail_category}] " if gmail_category else ""
-        max_sender_len = max(30, 65 - len(cat_str))
-        print(f"\n[{index}/{total_emails}] {cat_str}From: {sender[:max_sender_len]}")
-        print(f"  📅 {date} | 📝 {str(subject)[:70]}")
-        if trusted_hint:
-            print(f"  ✅ Trusted sender")
-
-        # Track for end-of-batch menu (decision filled in below)
-        entry = {"id": msg_ref["id"], "sender": sender, "subject": str(subject)[:60], "decision": None}
+        # Track for end-of-batch menu and final detailed report (decision/timing filled in below)
+        entry = {
+            "id": msg_ref["id"],
+            "sender": sender,
+            "subject": str(subject)[:60],
+            "date": date,
+            "category": gmail_category or "",
+            "decision": None,
+            "relevance_score": "?",
+            "elapsed": None,
+            "summary": "",
+            "reason": "",
+            "trusted": bool(trusted_hint),
+            "lang_note": "",
+        }
         batch_senders.append(entry)
         # Extract body
         plain_body = ""
@@ -362,7 +377,7 @@ def triage_and_label_emails():
         has_financial_detail, financial_hint = get_financial_hint(body)
 
         if trusted_hint:
-            print(f"  ✅ Trusted sender — skipping LLM, labelling ATTENTION directly")
+            entry["reason"] = "Trusted sender — skipped LLM, labelled ATTENTION directly."
             try:
                 call_with_timeout(
                     service.users().messages().modify(
@@ -370,12 +385,11 @@ def triage_and_label_emails():
                         body={"addLabelIds": [label_ids["ATTENTION"]], "removeLabelIds": ["INBOX"]}
                     ).execute
                 )
-                print(f"  👁️  → {LABEL_NAMES['ATTENTION']}")
             except (TimeoutError, Exception) as e:
-                print(f"  ⚠️  Label failed: {e}")
+                entry["reason"] += f" | ⚠️ Label failed: {e}"
             entry["decision"] = "ATTENTION"
             metrics["ATTENTION"] += 1
-            print("-" * 60)
+            print_progress(index, total_emails, entry)
             continue
 
         # Triage prompt — built in relevancy_prompt.py (only DELETE and ATTENTION
@@ -426,9 +440,12 @@ def triage_and_label_emails():
         except KeyboardInterrupt:
             raise
         except Exception as e:
-            print(f"⚠️  Ollama error: {e}")
             elapsed = time.time() - ai_start
             ai_times.append(elapsed)
+            entry["elapsed"] = elapsed
+            entry["reason"] = f"Ollama error: {e}"
+            entry["decision"] = "ERROR"
+            metrics["ERROR_FALLBACK"] += 1
             try:
                 call_with_timeout(
                     service.users().messages().modify(
@@ -436,12 +453,9 @@ def triage_and_label_emails():
                         body={"addLabelIds": [label_ids["ERROR"]], "removeLabelIds": []}
                     ).execute
                 )
-                entry["decision"] = "ERROR"
-                metrics["ERROR_FALLBACK"] += 1
-                print(f"  ⚙️  Labelled → {LABEL_NAMES['ERROR']} (Ollama unreachable)")
             except Exception as label_err:
-                print(f"  ⚠️  Could not apply error label: {label_err}")
-            print("-" * 60)
+                entry["reason"] += f" | ⚠️ Could not apply error label: {label_err}"
+            print_progress(index, total_emails, entry)
             continue
 
         elapsed = time.time() - ai_start
@@ -479,7 +493,7 @@ def triage_and_label_emails():
             lang_note = f"🌐 Detected language: {detected_language}"
             if translated_subject:
                 lang_note += f" | Translated subject: {translated_subject}"
-            print(f"  {lang_note}")
+            entry["lang_note"] = lang_note
 
         if decision not in valid_decisions:
             decision = "ERROR"
@@ -487,6 +501,11 @@ def triage_and_label_emails():
             metrics["ERROR_FALLBACK"] += 1
 
         metrics[decision] = metrics.get(decision, 0) + 1
+
+        entry["elapsed"] = elapsed
+        entry["relevance_score"] = relevance_score
+        entry["summary"] = summary
+        entry["reason"] = reason
 
         # Apply label — DELETE removes from INBOX (archived), ATTENTION/ERROR keep it visible
         labels_to_remove = ["INBOX"] if decision == "DELETE" else []
@@ -499,24 +518,13 @@ def triage_and_label_emails():
             )
             entry["decision"] = decision
             if decision == "DELETE":
-                decision_icon = "🗑️ "
                 delete_ids.append(msg_ref["id"])
-            elif decision == "ATTENTION":
-                decision_icon = "👁️ "
-            else:  # ERROR
-                decision_icon = "⚙️ "
         except (TimeoutError, Exception) as e:
-            print(f"⚠️  Label failed for {msg_ref['id']}: {e}")
+            entry["decision"] = decision
+            entry["reason"] += f" | ⚠️ Label failed: {e}"
             metrics["ERROR_FALLBACK"] += 1
-            decision_icon = "⚠️ "
 
-        # Reprint header with final decision icon (replaces the ⏳ placeholder)
-        label_name = LABEL_NAMES.get(decision, "label-failed")
-        print(f"  {decision_icon}{label_name} | ⏱ {elapsed:.1f}s | 📊 Rel: {relevance_score}/5")
-        if summary:
-            print(f"  💬 {summary}")
-        print(f"  💡 {reason}")
-        print("-" * 60)
+        print_progress(index, total_emails, entry)
 
 
     # ── Summary report ────────────────────────────────────────────────────────
@@ -535,6 +543,50 @@ def triage_and_label_emails():
     print(f"Avg Inference    : {avg_ai_time:.2f}s")
     print(f"Total Time       : {sum(ai_times):.2f}s")
     print("=" * 40 + "\n")
+
+    # ── Detailed results ──────────────────────────────────────────────────────
+    # Grouped NeedAttention → ProcessError → ToDelete (not processing order),
+    # sorted within each group by relevance score (highest first; unscored —
+    # e.g. trusted-sender skips — sort last). Message numbers below reflect
+    # this displayed order, not the order emails were originally processed.
+    GROUP_ORDER = ["ATTENTION", "ERROR", "DELETE"]
+    GROUP_ICONS = {"ATTENTION": "👁️ ", "ERROR": "⚙️ ", "DELETE": "🗑️ "}
+
+    def _relevance_sort_key(e):
+        try:
+            return -int(e.get("relevance_score", "?"))
+        except (ValueError, TypeError):
+            return 1  # unscored entries sort last within their group
+
+    grouped_entries = []
+    for key in GROUP_ORDER:
+        group_items = [e for e in batch_senders if e["decision"] == key]
+        group_items.sort(key=_relevance_sort_key)
+        grouped_entries.extend(group_items)
+
+    if grouped_entries:
+        print("=" * 40)
+        print("      DETAILED RESULTS")
+        print("=" * 40)
+        current_group = None
+        for i, e in enumerate(grouped_entries, start=1):
+            if e["decision"] != current_group:
+                current_group = e["decision"]
+                header = f" {LABEL_NAMES[current_group]} "
+                print(f"\n{header:─^40}")
+            cat_str = f"[{e['category']}] " if e.get("category") else ""
+            print(f"[{i}/{len(grouped_entries)}] {cat_str}From: {e['sender'][:60]}")
+            print(f"  📅 {e['date']} | 📝 {e['subject']}")
+            elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
+            print(f"  {GROUP_ICONS[e['decision']]}{LABEL_NAMES[e['decision']]} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
+            if e.get("lang_note"):
+                print(f"  {e['lang_note']}")
+            if e.get("summary"):
+                print(f"  💬 {e['summary']}")
+            if e.get("reason"):
+                print(f"  💡 {e['reason']}")
+            print("-" * 60)
+        print()
 
     # ── Post-batch menu ────────────────────────────────────────────────────────
     delete_count = metrics.get("DELETE", 0)
@@ -593,14 +645,14 @@ def triage_and_label_emails():
                 print("  Skipped — emails remain labelled but not trashed.\n")
 
         elif choice == "3":
-            if not batch_senders:
+            if not grouped_entries:
                 print("  No senders available.\n")
                 continue
             print("\n  Which email's sender would you like to add?")
-            for i, e in enumerate(batch_senders, start=1):
+            for i, e in enumerate(grouped_entries, start=1):
                 name, addr = parse_sender(e["sender"])
                 display = f"{name} <{addr}>" if name else addr
-                print(f"  [{i}/{len(batch_senders)}] {display}")
+                print(f"  [{i}/{len(grouped_entries)}] {display}")
                 print(f"        Subject: {e['subject']}")
             print("  (Enter number, or blank to cancel)")
             try:
@@ -612,12 +664,12 @@ def triage_and_label_emails():
                 continue
             try:
                 sel_idx = int(sel) - 1
-                if not (0 <= sel_idx < len(batch_senders)):
+                if not (0 <= sel_idx < len(grouped_entries)):
                     raise ValueError
             except ValueError:
                 print("  Invalid selection.\n")
                 continue
-            e = batch_senders[sel_idx]
+            e = grouped_entries[sel_idx]
             name, addr = parse_sender(e["sender"])
             print(f"\n  Sender : {name} <{addr}>")
             try:
@@ -628,7 +680,7 @@ def triage_and_label_emails():
             print()
 
         elif choice == "4":
-            labelled = [e for e in batch_senders if e["decision"] is not None]
+            labelled = grouped_entries  # same grouped/sorted order as the Detailed Results report above
             if not labelled:
                 print("  No labelled emails in this batch.\n")
                 continue
