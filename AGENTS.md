@@ -1,52 +1,42 @@
 # AGENTS.md — MailAgent
 
-Quick orientation for LLM agents (e.g. Ornith) working in this repo. Read this
-before making changes.
+Orientation for LLM agents (e.g. Ornith) working in this repo. Read before making changes.
 
 ## What this project does
 
-A CLI tool that triages a Gmail inbox using a **local** LLM via Ollama. It
-pulls the oldest untagged inbox emails in batches of 10, asks the LLM for a
+CLI tool that triages a Gmail inbox using a **local** LLM via Ollama. Pulls the
+oldest untagged inbox emails in batches of 10, asks the LLM for a
 DELETE/ATTENTION decision per email, applies a Gmail label, then shows a
 report + interactive menu (run another batch / trash marked emails / add
 trusted sender / correct a label).
 
-Core design principle: **the LLM does one bounded job** (classify this one
-email) — it never drives control flow, chains tools, or decides what happens
-next. All flow control is plain Python. Don't refactor this toward an
-agentic/tool-calling pattern; that's an explicit non-goal (see README.md
-"Approach" section for the rationale and the comparison project).
+**Non-goal: don't refactor toward agentic/tool-calling.** The LLM does one
+bounded job (classify this email); Python owns all control flow. See
+README.md "Approach" for rationale.
 
-**The model's decision (DELETE/ATTENTION) is final — code must not
-second-guess it using other fields the model returns.** `relevance_score`,
-`sender_type`, `action_required`, etc. are for display/reporting only. Do not
-add logic like "override to ATTENTION if relevance_score >= 4" or "force
-DELETE if sender_type == 'newsletter' even though decision was ATTENTION" —
-that would just be re-implementing triage in Python and defeats the point of
-asking the model. The only decisions that bypass the model entirely are
-pre-filters applied *before* the LLM is ever called, on facts the model never
-gets asked about — currently just the trusted-sender check in
-`load_contacts()`/`secrets/contacts.yml` (auto-ATTENTION, LLM skipped). Any
-new pre-filter must work the same way: decide before the prompt is built, not
-after the model responds. If you're asked to add a new "safety net" that
-overrides the model's decision after the fact, push back — that's the pattern
-this project deliberately avoids.
+**The model's DELETE/ATTENTION decision is final.** Other returned fields
+(`relevance_score`, `sender_type`, `action_required`, etc.) are display-only —
+never write logic that overrides the decision based on them. The only
+pre-model override is the trusted-sender check in `load_contacts()` /
+`secrets/contacts.yml` (auto-ATTENTION, LLM skipped entirely, decided before
+the prompt is built). New pre-filters must follow that same pattern. Push
+back on any request to add a post-hoc override.
 
 ## File map
 
 | File | Purpose |
 |---|---|
-| `mailAgent.py` | Entry point and main loop. Gmail fetch/label/trash, body extraction, Ollama call, post-batch menu. **Note capital A** — the file is `mailAgent.py`, not `mailagent.py`. |
-| `relevancy_prompt.py` | All prompt-construction logic: the triage prompt template, Gmail-category hints, financial-detail detection (`BILL_KEYWORDS` for owed money vs. `ACCOUNT_ACTIVITY_KEYWORDS` for money that already moved — see gotchas below), valid decision list. Edit this file to change triage behavior/wording. |
-| `config.py` | Loads `secrets/.env`, exposes `EMAIL_ACCOUNT`, `OLLAMA_MODEL`, `OLLAMA_HOST`, `MODEL_CONFIGS`/`DEFAULT_MODEL_CONFIG` (per-model Ollama options). No OAuth client-id/secret handling lives here — that's entirely `secrets/credentials.json` + `secrets/token.json` via `refresh_oauth_token.py`. Runs an Ollama connectivity check and prints status on import — importing this module has side effects (prints to stdout). |
-| `refresh_oauth_token.py` | `get_gmail_service()` — loads/refreshes/creates the OAuth token, returns an authorized Gmail API client. Run standalone to (re)authenticate. |
-| `requirements.txt` | Python deps: `beautifulsoup4`, `google-api-python-client`, `google-auth*`, `ollama`, `python-dotenv`, `pyyaml`. |
-| `README.md` | Full project docs: goals, architecture rationale, label table, setup steps, usage example output, model benchmark table. |
-| `OAUTH_SETUP.md` | Gmail OAuth setup guide (Google Cloud Console steps). |
-| `secrets/` | **Gitignored.** Holds `.env`, `credentials.json`, `token.json`, `contacts.yml`. Never read/print/commit these; treat as opaque local state. |
-| `config/labels.json` | Not present by default — user-created, gitignored (see `.gitignore`: `config/`). Maps label keys to Gmail label names. |
+| `mailAgent.py` | Entry point + main loop: Gmail fetch/label/trash, body extraction, Ollama call, post-batch menu. Note capital A. |
+| `relevancy_prompt.py` | Prompt construction: triage template, Gmail-category hints, financial-detail keyword sets, valid decision list. Edit here to change triage behavior/wording. |
+| `config.py` | Loads `secrets/.env`; exposes `EMAIL_ACCOUNT`, `OLLAMA_MODEL`, `OLLAMA_HOST`, `MODEL_CONFIGS`/`DEFAULT_MODEL_CONFIG`. No OAuth client-id/secret here (see `refresh_oauth_token.py`). Import has side effects: runs an Ollama connectivity check and prints status. |
+| `refresh_oauth_token.py` | `get_gmail_service()` — loads/refreshes/creates OAuth token, returns authorized Gmail client. Run standalone to (re)authenticate. |
+| `requirements.txt` | `beautifulsoup4`, `google-api-python-client`, `google-auth*`, `ollama`, `python-dotenv`, `pyyaml`. |
+| `README.md` | Full docs: architecture rationale, label table, setup, usage example, model benchmarks. |
+| `OAUTH_SETUP.md` | Gmail OAuth setup (Google Cloud Console steps). |
+| `secrets/` | Gitignored: `.env`, `credentials.json`, `token.json`, `contacts.yml`. Never read/print/commit. |
+| `config/labels.json` | Not present by default; user-created, gitignored. Maps label keys → Gmail label names. |
 
-## How the pieces connect (call graph)
+## Call graph
 
 ```
 mailAgent.py: triage_and_label_emails()   [main entry, run via __main__]
@@ -68,74 +58,59 @@ mailAgent.py: triage_and_label_emails()   [main entry, run via __main__]
 
 ## Key conventions / gotchas
 
-- **Labels are the single source of truth** for "already processed." An email
-  is skipped from future batches once it has any of the three
-  `LABEL_NAMES` values applied. To reprocess an email, remove the label in Gmail.
-- **`LABEL_NAMES` dict in `mailAgent.py` is the canonical label config** — the
-  README says to derive everything from it. Don't hardcode label strings
+- Labels are the source of truth for "already processed" — an email with any
+  `LABEL_NAMES` value is skipped from future batches. Remove the label in
+  Gmail to reprocess.
+- `LABEL_NAMES` in `mailAgent.py` is canonical — never hardcode label strings
   elsewhere.
-- **Only `DELETE` and `ATTENTION` are valid LLM outputs** (`VALID_DECISIONS` in
-  `relevancy_prompt.py`). `ERROR` is applied only in Python when the model is
-  unreachable, returns bad JSON, or returns something outside `VALID_DECISIONS`
-  — never ask the LLM to emit ERROR.
-- **`think=False` must be a top-level kwarg to `ollama_client.chat()`**, not
-  inside `options={}` — putting it in `options` silently no-ops. See the
-  "Suppressing Thinking Mode" section in README.md for the full 3-part
-  explanation (flag + temperature/top_p + regex strip of `<think>` as a safety net).
-- **Per-model Ollama options live in `config.MODEL_CONFIGS`**, keyed by exact
-  model string (e.g. `"qwen3.5:4b"`); anything not listed falls back to
-  `DEFAULT_MODEL_CONFIG`. Add new models there, not inline in `mailAgent.py`.
-- **Body extraction prefers plaintext but falls back to HTML** when the
-  plaintext part is too short or lacks a dollar figure the HTML has (see
-  `_has_dollar_amount` logic in `mailAgent.py`) — bank/invoice emails often
-  ship a near-empty plaintext alternative with the real numbers only in HTML.
-  Body is truncated to 1500 chars before prompting.
-- **Trusted senders bypass the LLM entirely** (`secrets/contacts.yml`,
-  loaded via `load_contacts()`), always resulting in ATTENTION.
-- **A dollar amount alone isn't enough to trigger a financial hint — it must
-  pair with a keyword.** `get_financial_hint()` checks two separate keyword
-  sets: `BILL_KEYWORDS` (balance/due date/minimum payment — something owed)
-  and `ACCOUNT_ACTIVITY_KEYWORDS` (transfer/deposit/withdrawal/Zelle/Venmo —
-  money that already moved). Both force ATTENTION even with zero action
-  required — completed account activity is ATTENTION-worthy purely because
-  it's information about a real account event, not because it needs a reply.
-  If you add new financial phrasing to detect, decide which bucket it
-  belongs to (owed vs. already-happened) rather than lumping into one list.
-- **DELETE removes the email from INBOX (archives it) immediately** when the
-  label is applied — it is not yet trashed. Actual deletion (Trash) only
-  happens via menu option 2, with a confirmation prompt. Don't change this
-  two-step safety behavior without being asked.
-- **Ctrl+C is handled via a `threading.Event` (`_stop`)**, not a raw
-  `KeyboardInterrupt` catch everywhere — checked between emails/menu loops so
-  the app stops cleanly rather than mid-operation.
-- Corrections (menu option 4) currently only flip the Gmail label live; there
-  is a documented but **not-yet-implemented** plan to persist flips to
-  `corrections.yml` for future learning (see README.md § "get better the
-  longer it runs" and the `TODO` comment in `mailAgent.py`). If asked to
-  implement this, that section of the README is the spec to follow.
+- Only `DELETE`/`ATTENTION` are valid LLM outputs (`VALID_DECISIONS`).
+  `ERROR` is Python-only, applied when the model is unreachable/returns
+  bad JSON/invalid value — never prompt the LLM to emit it.
+- `think=False` must be a top-level kwarg to `ollama_client.chat()`, not
+  inside `options={}` (silently no-ops there). Full rationale: README
+  "Suppressing Thinking Mode."
+- Per-model Ollama options live in `config.MODEL_CONFIGS`, keyed by exact
+  model string; unlisted models fall back to `DEFAULT_MODEL_CONFIG`. Add new
+  models there, not inline in `mailAgent.py`.
+- Body extraction prefers plaintext, falls back to HTML when plaintext is too
+  short or missing a dollar figure the HTML has (`_has_dollar_amount` in
+  `mailAgent.py`). Truncated to 1500 chars before prompting.
+- Trusted senders (`secrets/contacts.yml`, `load_contacts()`) always resolve
+  to ATTENTION, bypassing the LLM.
+- Financial hint needs dollar amount + keyword match, not amount alone.
+  `BILL_KEYWORDS` (balance/due date/minimum payment = owed) and
+  `ACCOUNT_ACTIVITY_KEYWORDS` (transfer/deposit/Zelle/Venmo = already moved)
+  are separate buckets; either forces ATTENTION. New phrasing → pick the
+  correct bucket.
+- DELETE archives immediately (removes from INBOX); actual Trash only via
+  menu option 2 + confirmation. Don't collapse this two-step safety behavior.
+- Ctrl+C uses `threading.Event` (`_stop`), checked between emails/menu loops
+  — not a raw `KeyboardInterrupt` catch.
+- Menu option 4 (corrections) only flips the label live today. Persisting to
+  `corrections.yml` for future learning is planned but unimplemented — see
+  README § "get better the longer it runs" + `TODO` in `mailAgent.py` if
+  asked to build it.
 
 ## Running / testing locally
 
 - Requires Ollama running locally with a model pulled (default
-  `qwen2.5:3b-instruct`) and a completed OAuth setup (`secrets/.env`,
-  `secrets/credentials.json`; `secrets/token.json` is auto-generated).
+  `qwen2.5:3b-instruct`) and completed OAuth setup (`secrets/.env`,
+  `secrets/credentials.json`; `secrets/token.json` auto-generated).
 - `pip install -r requirements.txt --break-system-packages` (or a venv).
 - Run: `python mailAgent.py`. First run opens a browser for OAuth consent.
-- `python refresh_oauth_token.py` re-runs auth standalone if the token is
+- `python refresh_oauth_token.py` re-runs auth standalone if token is
   stale/deleted.
-- `python config.py` prints a standalone config/auth summary (useful for
-  sanity-checking `.env` without touching Gmail).
-- There are no automated tests in this repo currently. Verify changes by
-  running against a real (or test) Gmail inbox and checking printed output.
+- `python config.py` prints a standalone config/auth summary without
+  touching Gmail.
+- No automated tests. Verify by running against a real/test inbox and
+  checking printed output.
 
 ## When making changes
 
 - Prompt/behavior tweaks → `relevancy_prompt.py`. Keep `build_triage_prompt`'s
-  required JSON response shape in sync with the parsing code in `mailAgent.py`
-  (`result.get(...)` calls) if you add/remove fields.
+  JSON response shape in sync with the parsing in `mailAgent.py`
+  (`result.get(...)` calls).
 - New label categories → update `LABEL_NAMES` in `mailAgent.py`; everything
-  else (label creation, report, menu) derives from that dict automatically —
-  do not add parallel hardcoded label logic.
-- New Ollama model support → add an entry to `MODEL_CONFIGS` in `config.py`.
-- Keep `secrets/` untouched/unread unless the task specifically requires
-  inspecting auth config — it's gitignored for a reason.
+  else derives from it automatically. No parallel hardcoded label logic.
+- New Ollama model support → add to `MODEL_CONFIGS` in `config.py`.
+- Leave `secrets/` untouched/unread unless the task specifically requires it.

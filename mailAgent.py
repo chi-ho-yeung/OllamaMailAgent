@@ -593,23 +593,23 @@ def triage_and_label_emails():
 
     while not _stop.is_set():
         print("What would you like to do?")
-        print("  1  Run another batch")
+        print("  R  Run another batch")
         if delete_count > 0:
-            print(f"  2  Move {delete_count} marked email(s) to Trash")
-        print("  3  Add a sender to contact list")
-        print("  4  Correct a label")
+            print(f"  T  Move {delete_count} marked email(s) to Trash")
+        print("  A  Add a sender to contact list (A.# to specify a given message number)")
+        print("  L  Correct a label (L.# to specify a given message number)")
         print("  x  Exit")
         try:
             choice = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             break
 
-        if choice == "1":
+        if choice == "r":
             print()
             triage_and_label_emails()
             return
 
-        elif choice == "2":
+        elif choice == "t":
             if delete_count == 0:
                 print("  No emails were marked for deletion in this batch.\n")
                 continue
@@ -644,7 +644,32 @@ def triage_and_label_emails():
             else:
                 print("  Skipped — emails remain labelled but not trashed.\n")
 
-        elif choice == "3":
+        # Handle 'a' for Add sender
+        if choice.startswith("a."):
+            try:
+                # Split 'a.N' and get N, then convert to 0-based index
+                index_str = choice.split('.', 1)[1]
+                sel_idx = int(index_str) - 1 # User enters 1-based index
+                if not (0 <= sel_idx < len(grouped_entries)):
+                    raise ValueError("Index out of bounds")
+                
+                # Perform the action directly
+                e = grouped_entries[sel_idx]
+                name, addr = parse_sender(e["sender"])
+                print(f"\n  Sender : {name} <{addr}>")
+                # For adding contact, we still need notes, so prompt for it.
+                try:
+                    notes = input("  Notes (optional, press Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    notes = ""
+                save_contact(name, addr, notes)
+                print()
+
+            except (IndexError, ValueError):
+                print("  Invalid selection format. Use 'A' to select from list or 'A.N' (e.g., A.3) for direct selection.\n")
+                continue
+
+        elif choice == "a": # If it was just 'a', proceed with interactive selection
             if not grouped_entries:
                 print("  No senders available.\n")
                 continue
@@ -679,8 +704,42 @@ def triage_and_label_emails():
             save_contact(name, addr, notes)
             print()
 
-        elif choice == "4":
-            labelled = grouped_entries  # same grouped/sorted order as the Detailed Results report above
+        # Handle 'l' for Correct label
+        elif choice.startswith("l."):
+            try:
+                index_str = choice.split('.', 1)[1]
+                sel_idx = int(index_str) - 1
+                if not (0 <= sel_idx < len(labelled)):
+                    raise ValueError("Index out of bounds")
+                
+                e = labelled[sel_idx]
+                old_decision = e["decision"]
+                new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
+                old_label_id = label_ids[old_decision]
+                new_label_id = label_ids[new_decision]
+
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=e["id"],
+                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
+                    ).execute
+                )
+                if new_decision == "DELETE":
+                    delete_ids.append(e["id"])
+                    delete_count += 1
+                elif e["id"] in delete_ids:
+                    delete_ids.remove(e["id"])
+                    delete_count -= 1
+
+                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
+                print(f"  📝 Logged as correction for future learning.\n")
+                e["decision"] = new_decision
+
+            except (IndexError, ValueError):
+                print("  Invalid selection format. Use 'L' to select from list or 'L.N' (e.g., L.3) for direct selection.\n")
+                continue
+
+        elif choice == "l": # If it was just 'l', proceed with interactive selection
             if not labelled:
                 print("  No labelled emails in this batch.\n")
                 continue
@@ -720,7 +779,6 @@ def triage_and_label_emails():
                         body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
                     ).execute
                 )
-                # Keep delete_ids in sync
                 if new_decision == "DELETE":
                     delete_ids.append(e["id"])
                     delete_count += 1
@@ -730,7 +788,6 @@ def triage_and_label_emails():
 
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
                 print(f"  📝 Logged as correction for future learning.\n")
-                # TODO: log flip to corrections.yml for prompt improvement analysis
                 e["decision"] = new_decision
             except Exception as ex:
                 print(f"  ⚠️  Failed to update label: {ex}\n")
@@ -740,7 +797,7 @@ def triage_and_label_emails():
             break
 
         else:
-            print("  Unrecognised option. Please choose 1, 2, 3, 4, or x.\n")
+            print("  Unrecognised option. Please choose R, T, A, L, or x.\n")
 
 
 if __name__ == "__main__":

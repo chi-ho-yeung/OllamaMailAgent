@@ -120,10 +120,10 @@ Once enough corrections accumulate, they can be used to:
    1-NeedAttention → 1-ProcessError → 1-ToDelete, sorted by relevance score
    within each group (message numbers reflect this order, not processing order)
 8. Post-batch menu:
-     1  Run another batch
-     2  Move marked emails to Trash (with confirmation)
-     3  Add a sender to the trusted contact list (same grouped order/numbering as step 7)
-     4  Correct a label (flip DELETE ↔ ATTENTION, same grouped order/numbering as step 7)
+     R  Run another batch
+     T  Move marked emails to Trash (with confirmation)
+     A  Add a sender to the trusted contact list (A.# to specify a given message number)
+     L  Correct a label (L.# to specify a given message number)
      x  Exit
 ```
 
@@ -235,10 +235,10 @@ Total Time       : 132.6s
 ...
 
 What would you like to do?
-  1  Run another batch
-  2  Move 6 marked email(s) to Trash
-  3  Add a sender to contact list
-  4  Correct a label
+  R  Run another batch
+  T  Move 6 marked email(s) to Trash
+  A  Add a sender to contact list
+  L  Correct a label
   x  Exit
 
 >
