@@ -23,14 +23,16 @@ import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from email.header import decode_header
-from config import EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS, DEFAULT_MODEL_CONFIG
+from config import EMAIL_ACCOUNT, USER_NAME, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS, DEFAULT_MODEL_CONFIG
 from refresh_oauth_token import get_gmail_service
 from relevancy_prompt import (
     USER_LANGUAGES,
     VALID_DECISIONS,
+    VALID_VERDICTS,
+    MATCHED_RULE_REASONS,
     get_category_hint,
-    get_financial_hint,
-    build_triage_prompt,
+    build_stage1_prompt,
+    build_stage2_prompt,
 )
 from bs4 import BeautifulSoup
 
@@ -71,6 +73,79 @@ def call_with_timeout(fn, *args, timeout=30, **kwargs):
             return future.result(timeout=timeout)
         except FuturesTimeoutError:
             raise TimeoutError(f"API call timed out after {timeout}s")
+
+
+def _run_ollama_chat(prompt):
+    """
+    Send `prompt` to the configured Ollama model and return the raw response
+    text. Shared by both triage stages so the chat_kwargs/model-options
+    plumbing and the dict-vs-ChatResponse response handling only live once.
+    """
+    chat_kwargs = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+    }
+    # Use the model's specific config, falling back to DEFAULT_MODEL_CONFIG
+    # (num_ctx=8192, format=json) for any model not explicitly listed
+    model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
+    if "format" in model_options:  # top-level param in ollama.chat
+        chat_kwargs["format"] = model_options.pop("format")
+    if "think" in model_options:   # top-level param for models that support it
+        chat_kwargs["think"] = model_options.pop("think")
+    if model_options:
+        chat_kwargs["options"] = model_options
+
+    response = ollama_client.chat(**chat_kwargs)
+    # Handle both dict and object (ChatResponse) returns from ollama library
+    if isinstance(response, dict):
+        msg_obj = response.get("message", {})
+        return msg_obj.get("content", "") if isinstance(msg_obj, dict) else str(msg_obj)
+    elif hasattr(response, "message"):
+        # ollama >= 0.2 returns a ChatResponse object: response.message.content
+        msg_obj = response.message
+        return msg_obj.content if hasattr(msg_obj, "content") else str(msg_obj)
+    else:
+        return str(response)
+
+
+def _parse_json_response(response_text):
+    """Strip <think>...</think> blocks / markdown fences a model might emit, then json.loads()."""
+    clean = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
+    clean = re.sub(r"^```(?:json)?", "", clean).strip()
+    clean = re.sub(r"```$", "", clean).strip()
+    return json.loads(clean)
+
+
+def _decode_mime_header(raw_header):
+    """
+    Fully decode an RFC 2047 MIME-encoded header (e.g. "=?UTF-8?B?...?=")
+    into plain text. Used for Subject, From, and Reply-To — any of these can
+    carry MIME-encoded display names when they contain non-ASCII characters
+    (accents, trademark symbols, emoji, etc.).
+
+    decode_header() can return MULTIPLE (bytes_or_str, encoding) segments for
+    a single header — joining only the first segment (as earlier code did for
+    Subject) silently truncates headers split across more than one encoded
+    word. This joins all of them.
+
+    Passing a raw, undecoded header straight to the LLM is worse than just a
+    display bug: a model given "=?UTF-8?B?VGFyZ2V0...?=" instead of "Target
+    Circle™ Card" has no readable language to identify and may report a
+    language at random — which is exactly the failure mode this fixes.
+    """
+    if not raw_header:
+        return ""
+    try:
+        parts = decode_header(raw_header)
+        decoded = []
+        for part, enc in parts:
+            if isinstance(part, bytes):
+                decoded.append(part.decode(enc or "utf-8", errors="ignore"))
+            else:
+                decoded.append(part)
+        return "".join(decoded)
+    except Exception:
+        return raw_header
 
 
 def clean_text(text_body):
@@ -287,14 +362,14 @@ def triage_and_label_emails():
             metrics["ERROR_FALLBACK"] += 1
             continue
 
-        # Extract headers
-        try:
-            subject_raw, encoding = decode_header(msg.get("Subject") or "No Subject")[0]
-            subject = subject_raw.decode(encoding or "utf-8", errors="ignore") if isinstance(subject_raw, bytes) else subject_raw
-        except Exception:
-            subject = "No Subject"
-
-        sender = msg.get("From") or "Unknown"
+        # Extract headers — decode_header() handles RFC 2047 MIME encoding
+        # (e.g. "=?UTF-8?B?...?="), which Gmail/senders use for any non-ASCII
+        # character in a header (accents, trademark symbols, emoji). Applied
+        # to Subject, From, AND Reply-To — a raw, undecoded header passed to
+        # the LLM looks like meaningless base64 noise, not real text.
+        subject = _decode_mime_header(msg.get("Subject")) or "No Subject"
+        sender = _decode_mime_header(msg.get("From")) or "Unknown"
+        reply_to = _decode_mime_header(msg.get("Reply-To"))
         raw_date = msg.get("Date") or "Unknown"
         # Simplify date: remove time portion (e.g. Wed, 20 May 2026 21:26:42 +0000 -> Wed, 20 May 2026)
         date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
@@ -369,13 +444,6 @@ def triage_and_label_emails():
 
         body = body[:1500]
 
-        # Flag emails that contain concrete financial figures (dollar amount +
-        # a balance/due-date keyword) even if their subject sounds like a
-        # routine "your statement is ready" notification — these carry real
-        # actionable info (amount owed, due date) the user needs to see.
-        # (logic lives in relevancy_prompt.py)
-        has_financial_detail, financial_hint = get_financial_hint(body)
-
         if trusted_hint:
             entry["reason"] = "Trusted sender — skipped LLM, labelled ATTENTION directly."
             try:
@@ -392,58 +460,31 @@ def triage_and_label_emails():
             print_progress(index, total_emails, entry)
             continue
 
-        # Triage prompt — built in relevancy_prompt.py (only DELETE and ATTENTION
-        # are valid LLM outputs; ERROR is reserved for processing failures)
-        prompt = build_triage_prompt(
+        # ── Stage 1: cheap triage — sorts into KEEP / DISCARD / UNSURE ──────
+        stage1_prompt = build_stage1_prompt(
             sender=sender,
             date=date,
             subject=subject,
             body=body,
             category_hint=category_hint,
-            financial_hint=financial_hint,
         )
 
-        # Run Ollama
+        summary = ""
+        reason = ""
+        relevance_score = "?"
+        detected_language = ""
+        decision = None
+
         ai_start = time.time()
         try:
-            chat_kwargs = {
-                "model": OLLAMA_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-            }
-            
-            # Use the model's specific config, falling back to DEFAULT_MODEL_CONFIG
-            # (num_ctx=8192, format=json) for any model not explicitly listed
-            model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
-            
-            # "format" is a top-level parameter in ollama.chat
-            if "format" in model_options:
-                chat_kwargs["format"] = model_options.pop("format")
-            
-            # "think" is a top-level parameter for models that support it
-            if "think" in model_options:
-                chat_kwargs["think"] = model_options.pop("think")
-            
-            if model_options:
-                chat_kwargs["options"] = model_options
-                
-            response = ollama_client.chat(**chat_kwargs)
-            # Handle both dict and object (ChatResponse) returns from ollama library
-            if isinstance(response, dict):
-                msg_obj = response.get("message", {})
-                response_text = msg_obj.get("content", "") if isinstance(msg_obj, dict) else str(msg_obj)
-            elif hasattr(response, "message"):
-                # ollama >= 0.2 returns a ChatResponse object: response.message.content
-                msg_obj = response.message
-                response_text = msg_obj.content if hasattr(msg_obj, "content") else str(msg_obj)
-            else:
-                response_text = str(response)
+            stage1_text = _run_ollama_chat(stage1_prompt)
         except KeyboardInterrupt:
             raise
         except Exception as e:
             elapsed = time.time() - ai_start
             ai_times.append(elapsed)
             entry["elapsed"] = elapsed
-            entry["reason"] = f"Ollama error: {e}"
+            entry["reason"] = f"Ollama error (stage 1): {e}"
             entry["decision"] = "ERROR"
             metrics["ERROR_FALLBACK"] += 1
             try:
@@ -458,47 +499,76 @@ def triage_and_label_emails():
             print_progress(index, total_emails, entry)
             continue
 
-        elapsed = time.time() - ai_start
-        ai_times.append(elapsed)
-
-        # Parse decision — strip <think>...</think> blocks Qwen3 thinking mode emits
-        valid_decisions = VALID_DECISIONS
+        verdict = None
+        matched_rule = "NONE"
         try:
-            clean_response = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
-            clean_response = re.sub(r"^```(?:json)?", "", clean_response).strip()
-            clean_response = re.sub(r"```$", "", clean_response).strip()
-            result = json.loads(clean_response)
-            decision = result.get("decision", "").upper()
-            summary = result.get("summary", "")
-            reason = result.get("reason", "No reason provided.")
-            sender_type = result.get("sender_type", "Unknown")
-            action_required = result.get("action_required", "None")
-            relevance_score = result.get("relevance_score", "?")
-            detected_language = result.get("detected_language", "").strip()
-            translated_subject = result.get("translated_subject", "").strip()
+            stage1_result = _parse_json_response(stage1_text)
+            verdict = stage1_result.get("verdict", "").upper()
+            matched_rule = stage1_result.get("matched_rule", "NONE").upper()
+            relevance_score = stage1_result.get("relevance_score", "?")
+            detected_language = stage1_result.get("detected_language", "").strip()
         except Exception:
-            decision = "ERROR"
-            summary = ""
-            reason = f"Could not parse model response. Raw: {response_text[:120]!r}"
-            sender_type = action_required = "Unknown"
-            relevance_score = "?"
-            detected_language = ""
-            translated_subject = ""
+            reason = f"Could not parse stage 1 response. Raw: {stage1_text[:120]!r}"
             metrics["ERROR_FALLBACK"] += 1
 
-        # If the email wasn't in a language the user reads, surface the
-        # translated subject so they're not left guessing what it said.
+        # Rule 1 (language) is ENFORCED HERE IN CODE, not left to the model's
+        # own final verdict — the model is reliable at identifying what
+        # language something is written in; it's much less reliable at also
+        # correctly applying "therefore DELETE" once other content (a promo,
+        # an appointment) is pulling it another way. So the model only
+        # reports the language, and code makes the DELETE call — and skips
+        # stage 2 entirely, since a foreign-language email doesn't need a
+        # judgment call, it just needs deleting.
         is_foreign_language = bool(detected_language) and detected_language not in USER_LANGUAGES
         if is_foreign_language:
-            lang_note = f"🌐 Detected language: {detected_language}"
-            if translated_subject:
-                lang_note += f" | Translated subject: {translated_subject}"
-            entry["lang_note"] = lang_note
+            entry["lang_note"] = f"🌐 Detected language: {detected_language}"
 
-        if decision not in valid_decisions:
+        if verdict is None:
             decision = "ERROR"
-            reason = f"Model returned unrecognised decision, tagged for review. Raw decision: {result.get('decision', '?')!r}" if 'result' in dir() else reason
+        elif is_foreign_language:
+            decision = "DELETE"
+            reason = f"Non-target-language email ('{detected_language}') — deleted regardless of stage 1 verdict."
+        elif verdict == "KEEP":
+            decision = "ATTENTION"
+            reason = MATCHED_RULE_REASONS.get(matched_rule, "Stage 1 matched a keep-worthy rule.")
+        elif verdict == "DISCARD":
+            decision = "DELETE"
+            reason = MATCHED_RULE_REASONS.get("JUNK", "Stage 1 matched generic/junk criteria.")
+        elif verdict == "UNSURE":
+            # ── Stage 2: only for genuinely ambiguous survivors ─────────────
+            stage2_prompt = build_stage2_prompt(
+                sender=sender,
+                date=date,
+                subject=subject,
+                body=body,
+                category_hint=category_hint,
+                user_name=USER_NAME,
+                reply_to=reply_to,
+            )
+            try:
+                stage2_text = _run_ollama_chat(stage2_prompt)
+                stage2_result = _parse_json_response(stage2_text)
+                decision = stage2_result.get("decision", "").upper()
+                summary = stage2_result.get("summary", "")
+                reason = stage2_result.get("reason", "No reason provided.")
+                relevance_score = stage2_result.get("relevance_score", relevance_score)
+                if decision not in VALID_DECISIONS:
+                    reason = f"Stage 2 returned unrecognised decision {decision!r}. {reason}"
+                    decision = "ERROR"
+                    metrics["ERROR_FALLBACK"] += 1
+            except KeyboardInterrupt:
+                raise
+            except Exception as e:
+                decision = "ERROR"
+                reason = f"Stage 2 error/parse failure: {e}"
+                metrics["ERROR_FALLBACK"] += 1
+        else:
+            decision = "ERROR"
+            reason = f"Stage 1 returned unrecognised verdict: {verdict!r}"
             metrics["ERROR_FALLBACK"] += 1
+
+        elapsed = time.time() - ai_start
+        ai_times.append(elapsed)
 
         metrics[decision] = metrics.get(decision, 0) + 1
 
@@ -593,23 +663,23 @@ def triage_and_label_emails():
 
     while not _stop.is_set():
         print("What would you like to do?")
-        print("  1  Run another batch")
+        print("  R  Run another batch")
         if delete_count > 0:
-            print(f"  2  Move {delete_count} marked email(s) to Trash")
-        print("  3  Add a sender to contact list")
-        print("  4  Correct a label")
+            print(f"  T  Move {delete_count} marked email(s) to Trash")
+        print("  A  Add a sender to contact list (A.# to specify a given message number)")
+        print("  L  Correct a label (L.# to specify a given message number)")
         print("  x  Exit")
         try:
             choice = input("\n> ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             break
 
-        if choice == "1":
+        if choice == "r":
             print()
             triage_and_label_emails()
             return
 
-        elif choice == "2":
+        elif choice == "t":
             if delete_count == 0:
                 print("  No emails were marked for deletion in this batch.\n")
                 continue
@@ -644,7 +714,32 @@ def triage_and_label_emails():
             else:
                 print("  Skipped — emails remain labelled but not trashed.\n")
 
-        elif choice == "3":
+        # Handle 'a' for Add sender
+        if choice.startswith("a."):
+            try:
+                # Split 'a.N' and get N, then convert to 0-based index
+                index_str = choice.split('.', 1)[1]
+                sel_idx = int(index_str) - 1 # User enters 1-based index
+                if not (0 <= sel_idx < len(grouped_entries)):
+                    raise ValueError("Index out of bounds")
+                
+                # Perform the action directly
+                e = grouped_entries[sel_idx]
+                name, addr = parse_sender(e["sender"])
+                print(f"\n  Sender : {name} <{addr}>")
+                # For adding contact, we still need notes, so prompt for it.
+                try:
+                    notes = input("  Notes (optional, press Enter to skip): ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    notes = ""
+                save_contact(name, addr, notes)
+                print()
+
+            except (IndexError, ValueError):
+                print("  Invalid selection format. Use 'A' to select from list or 'A.N' (e.g., A.3) for direct selection.\n")
+                continue
+
+        elif choice == "a": # If it was just 'a', proceed with interactive selection
             if not grouped_entries:
                 print("  No senders available.\n")
                 continue
@@ -679,16 +774,50 @@ def triage_and_label_emails():
             save_contact(name, addr, notes)
             print()
 
-        elif choice == "4":
-            labelled = grouped_entries  # same grouped/sorted order as the Detailed Results report above
-            if not labelled:
+        # Handle 'l' for Correct label
+        elif choice.startswith("l."):
+            try:
+                index_str = choice.split('.', 1)[1]
+                sel_idx = int(index_str) - 1
+                if not (0 <= sel_idx < len(grouped_entries)):
+                    raise ValueError("Index out of bounds")
+                
+                e = grouped_entries[sel_idx]
+                old_decision = e["decision"]
+                new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
+                old_label_id = label_ids[old_decision]
+                new_label_id = label_ids[new_decision]
+
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=e["id"],
+                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
+                    ).execute
+                )
+                if new_decision == "DELETE":
+                    delete_ids.append(e["id"])
+                    delete_count += 1
+                elif e["id"] in delete_ids:
+                    delete_ids.remove(e["id"])
+                    delete_count -= 1
+
+                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
+                print(f"  📝 Logged as correction for future learning.\n")
+                e["decision"] = new_decision
+
+            except (IndexError, ValueError):
+                print("  Invalid selection format. Use 'L' to select from list or 'L.N' (e.g., L.3) for direct selection.\n")
+                continue
+
+        elif choice == "l": # If it was just 'l', proceed with interactive selection
+            if not grouped_entries:
                 print("  No labelled emails in this batch.\n")
                 continue
             print("\n  Which email's label would you like to correct?")
-            for i, e in enumerate(labelled, start=1):
+            for i, e in enumerate(grouped_entries, start=1):
                 _, addr = parse_sender(e["sender"])
                 icon = "🗑️ " if e["decision"] == "DELETE" else ("👁️ " if e["decision"] == "ATTENTION" else "⚙️ ")
-                print(f"  [{i}/{len(labelled)}] {icon} {LABEL_NAMES[e['decision']]}")
+                print(f"  [{i}/{len(grouped_entries)}] {icon} {LABEL_NAMES[e['decision']]}")
                 print(f"        From   : {addr}")
                 print(f"        Subject: {e['subject']}")
             print("  (Enter number, or blank to cancel)")
@@ -701,13 +830,13 @@ def triage_and_label_emails():
                 continue
             try:
                 sel_idx = int(sel) - 1
-                if not (0 <= sel_idx < len(labelled)):
+                if not (0 <= sel_idx < len(grouped_entries)):
                     raise ValueError
             except ValueError:
                 print("  Invalid selection.\n")
                 continue
 
-            e = labelled[sel_idx]
+            e = grouped_entries[sel_idx]
             old_decision = e["decision"]
             new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
             old_label_id = label_ids[old_decision]
@@ -720,7 +849,6 @@ def triage_and_label_emails():
                         body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
                     ).execute
                 )
-                # Keep delete_ids in sync
                 if new_decision == "DELETE":
                     delete_ids.append(e["id"])
                     delete_count += 1
@@ -730,7 +858,6 @@ def triage_and_label_emails():
 
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
                 print(f"  📝 Logged as correction for future learning.\n")
-                # TODO: log flip to corrections.yml for prompt improvement analysis
                 e["decision"] = new_decision
             except Exception as ex:
                 print(f"  ⚠️  Failed to update label: {ex}\n")
@@ -740,7 +867,7 @@ def triage_and_label_emails():
             break
 
         else:
-            print("  Unrecognised option. Please choose 1, 2, 3, 4, or x.\n")
+            print("  Unrecognised option. Please choose R, T, A, L, or x.\n")
 
 
 if __name__ == "__main__":

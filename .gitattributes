@@ -1,6 +1,6 @@
 # Normalize line endings to LF in the repository,
 # and convert to native line endings on checkout.
-* text=auto
+* text=auto eol=lf
 
 # Explicitly LF for all text files
 *.py text eol=lf
