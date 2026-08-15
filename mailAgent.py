@@ -62,7 +62,7 @@ def print_progress(index, total, entry):
     max_sender_len = max(30, 55 - len(cat_str))
     elapsed = entry.get("elapsed")
     elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "skip"
-    print(f"[{index}/{total}] {cat_str}From: {entry['sender'][:max_sender_len]} | 📅 {entry['date']} | 📝 {entry['subject'][:40]} | ⏱ {elapsed_str}")
+    print(f"[{index}/{total}] {entry['date']} {cat_str}From: {entry['sender'][:max_sender_len]} | 📝 {entry['subject'][:40]} | ⏱ {elapsed_str}")
 
 
 def call_with_timeout(fn, *args, timeout=30, **kwargs):
@@ -370,9 +370,15 @@ def triage_and_label_emails():
         subject = _decode_mime_header(msg.get("Subject")) or "No Subject"
         sender = _decode_mime_header(msg.get("From")) or "Unknown"
         reply_to = _decode_mime_header(msg.get("Reply-To"))
-        raw_date = msg.get("Date") or "Unknown"
         # Simplify date: remove time portion (e.g. Wed, 20 May 2026 21:26:42 +0000 -> Wed, 20 May 2026)
-        date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
+        raw_date = msg.get("Date") or "Unknown"
+        # Convert "Wed, 20 May 2026 21:26:42 +0000" to "05/20/2026"
+        try:
+            from email.utils import parsedate_to_datetime
+            dt = parsedate_to_datetime(raw_date)
+            date = dt.strftime("%m/%d/%Y")
+        except Exception:
+            date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
 
         # Map Gmail category labels to human-readable hints (logic lives in relevancy_prompt.py)
         gmail_category, category_hint = get_category_hint(gmail_labels)
@@ -645,8 +651,8 @@ def triage_and_label_emails():
                 header = f" {LABEL_NAMES[current_group]} "
                 print(f"\n{header:─^40}")
             cat_str = f"[{e['category']}] " if e.get("category") else ""
-            print(f"[{i}/{len(grouped_entries)}] {cat_str}From: {e['sender'][:60]}")
-            print(f"  📅 {e['date']} | 📝 {e['subject']}")
+            print(f"[{i}/{len(grouped_entries)}] {e['date']} {cat_str}From: {e['sender'][:60]}")
+            print(f"  📝 {e['subject']}")
             elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
             print(f"  {GROUP_ICONS[e['decision']]}{LABEL_NAMES[e['decision']]} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
             if e.get("lang_note"):
