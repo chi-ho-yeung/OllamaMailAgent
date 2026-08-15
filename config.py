@@ -22,6 +22,11 @@ load_dotenv(SECRETS_DIR / ".env")
 # Gmail account address (display/logging only)
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT", "")
 
+# User's own name, so the triage prompt can check whether an email actually
+# addresses them personally (a signal of genuine correspondence vs a mass
+# sales pitch). Leave unset in .env to skip that signal.
+USER_NAME = os.getenv("USER_NAME", "")
+
 # Check if Ollama is running
 import ollama as ollama_client
 OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")

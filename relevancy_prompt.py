@@ -1,52 +1,54 @@
 """
 ================================================================================
-RELEVANCY PROMPT MODULE
+RELEVANCY PROMPT MODULE — TWO-STAGE PIPELINE
 ================================================================================
-Builds the LLM prompt used to triage an email as DELETE or ATTENTION, plus the
-small pieces of "hint" text (Gmail category, financial-detail detection) that
-feed into it.
+Builds the two LLM prompts used to triage an email, plus the Gmail-category
+hint text and deterministic script filter that feed into them.
 
-Kept separate from mailAgent.py so the triage wording/logic can be tuned,
-tested, or swapped independently of the Gmail/Ollama plumbing.
+STAGE 1 (build_stage1_prompt): cheap, narrow pass. Sorts every email into
+KEEP / DISCARD / UNSURE against the objective rules (money, deadline,
+notice, valid promo) or confidently-junk criteria. Most emails should
+resolve here.
+
+STAGE 2 (build_stage2_prompt): only run for emails stage 1 marked UNSURE.
+This is where the soft judgment call lives (recency, addressed by name,
+the PERSON rule, sales-pitch tone) — it gets the full JSON schema and
+more reasoning room since only the ambiguous minority reach it. PERSON
+(is this from a real individual, not an automated system?) lives here
+rather than in stage 1 on purpose: sender identity can be spoofed by a
+personal-looking "From" name paired with a business-looking "Reply-To",
+and catching that needs the closer, cross-referenced look stage 2 gives
+it — not a fast pattern match.
+
+Splitting the work this way means each individual call asks a small model
+to do less at once — narrow, low-ambiguity classification is where small
+models tend to be reliable; multi-factor arbitration in a single pass is
+where they aren't.
+
+Stage 1 also reports "detected_language" for every email. Language is NOT
+a rule the LLM is trusted to apply on its own — the model is reliable at
+identifying what language something is written in, less reliable at also
+correctly applying "therefore DELETE" once other content (a promo, an
+appointment) is pulling it toward KEEP. So the model only reports the
+language, and mailAgent.py enforces the DELETE call in code, overriding
+whatever verdict stage 1 reached, before stage 2 is ever considered.
 ================================================================================
 """
-import re
 from datetime import datetime
 
 # Gmail category label -> (human-readable name, short triage lean).
-# Kept intentionally brief: the full ATTENTION/DELETE criteria live once, in
-# DECISION CRITERIA below, so these hints only need to say which way a
-# category leans by default (plus any category-specific exception).
 CATEGORY_MAP = {
-    "CATEGORY_PROMOTIONS": ("Promotions", "Lean DELETE — exception: a limited-time offer, expiring deal, or discount that may be genuinely useful."),
-    "CATEGORY_SOCIAL":     ("Social",     "Lean DELETE."),
-    "CATEGORY_UPDATES":    ("Updates",    "Neutral — judge case-by-case against DECISION CRITERIA below."),
-    "CATEGORY_FORUMS":     ("Forums",     "Lean DELETE."),
-    "CATEGORY_PERSONAL":   ("Personal",   "Lean ATTENTION."),
+    "CATEGORY_PROMOTIONS": ("Promotions", "Lean DISCARD — exception: a limited-time offer, expiring deal, or discount that may be genuinely useful."),
+    "CATEGORY_SOCIAL":     ("Social",     "Lean DISCARD."),
+    "CATEGORY_UPDATES":    ("Updates",    "Neutral — judge case-by-case against the rules below."),
+    "CATEGORY_FORUMS":     ("Forums",     "Lean DISCARD."),
+    "CATEGORY_PERSONAL":   ("Personal",   "Lean KEEP."),
 }
 
 USER_LANGUAGES = ["English", "Spanish"]
 
-# Keywords indicating a bill/obligation (something owed, with a due date).
-BILL_KEYWORDS = (
-    "balance", "due date", "minimum payment", "amount due",
-    "payment due", "past due", "autopay", "statement balance",
-)
-
-# Keywords indicating account activity that already happened (money moved).
-# Not actionable, but still important — see get_financial_hint().
-ACCOUNT_ACTIVITY_KEYWORDS = (
-    "transfer", "transferred", "deposit", "deposited", "withdrawal",
-    "withdrew", "debited", "credited", "you sent", "sent you",
-    "payment received", "payment sent", "wire transfer", "direct deposit",
-    "zelle", "venmo",
-)
-
-VALID_DECISIONS = ["DELETE", "ATTENTION"]
-
-# Matches "$500", "$1,200", "$500.00" — decimals optional so plain-dollar
-# transfer amounts (no cents) still count as a "specific dollar amount".
-_DOLLAR_AMOUNT_RE = re.compile(r'\$[\d,]+(?:\.\d{2})?')
+VALID_DECISIONS = ["DELETE", "ATTENTION"]        # stage 2's final call
+VALID_VERDICTS = ["KEEP", "DISCARD", "UNSURE"]   # stage 1's triage call
 
 
 def get_category_hint(gmail_labels):
@@ -56,62 +58,39 @@ def get_category_hint(gmail_labels):
     return None, ""
 
 
-def get_financial_hint(body):
-    """
-    Detects a specific dollar amount paired with either bill/obligation
-    language or account-activity language, and returns a hint telling the
-    model this is ATTENTION-worthy — regardless of whether it requires
-    action. See DECISION CRITERIA in build_triage_prompt() for the policy
-    this hint is reinforcing.
-    """
-    has_amount = _DOLLAR_AMOUNT_RE.search(body) is not None
-    body_lower = body.lower()
-    is_bill = has_amount and any(kw in body_lower for kw in BILL_KEYWORDS)
-    is_activity = has_amount and any(kw in body_lower for kw in ACCOUNT_ACTIVITY_KEYWORDS)
-
-    if is_bill:
-        hint = (
-            "IMPORTANT: This email pairs a specific dollar amount with bill/"
-            "payment language (e.g. a balance, minimum payment, or due date). "
-            "Use ATTENTION, not DELETE — this holds even if the subject line "
-            "sounds like a routine 'statement is ready' notification."
-        )
-    elif is_activity:
-        hint = (
-            "IMPORTANT: This email reports a specific dollar amount actually "
-            "moving in one of the user's accounts (a transfer, deposit, "
-            "withdrawal, or similar). Use ATTENTION, not DELETE, even though "
-            "no action is required — a record of money moving in a real "
-            "account is inherently important information, not routine noise."
-        )
-    else:
-        hint = ""
-
-    return (is_bill or is_activity), hint
+# Human-readable reason text for each stage-1 matched_rule code. Generated
+# in code rather than asked of the model for KEEP/DISCARD cases — these are
+# meant to be the "obvious" cases, so the reason should be consistent and
+# doesn't need per-email prose from a (possibly small) model.
+MATCHED_RULE_REASONS = {
+    "MONEY":    "Stage 1: matches the MONEY rule — a bill/payment due or account activity with a specific dollar amount.",
+    "DEADLINE": "Stage 1: matches the DEADLINE/REPLY rule — requires a reply, or has an appointment/deadline that hasn't passed.",
+    "NOTICE":   "Stage 1: matches the NOTICE rule — a security alert, account change, receipt, or medical/tax/legal notice.",
+    "PROMO":    "Stage 1: matches the PROMOTION rule — a promotion or deal with an expiration date that hasn't passed.",
+    "JUNK":     "Stage 1: generic marketing, newsletter, social/forum digest, expired promotion, or automated status update with no keep-signal.",
+}
 
 
-def build_triage_prompt(sender, date, subject, body, category_hint=" ", financial_hint=""):
+def build_stage1_prompt(sender, date, subject, body, category_hint=" "):
     today_now = datetime.now().strftime("%Y-%m-%d")
-    languages_str = " or ".join(USER_LANGUAGES)
-    prompt = f"""You are an advanced AI email triage assistant. Analyze the email below and decide whether it needs attention or should be deleted.
-
-Prioritize actionability, personal relevance, and important account/financial/legal/health information over generic marketing or automated noise.
+    prompt = f"""You are STAGE ONE of a two-stage email triage pipeline. Your only job is to sort this email into KEEP, DISCARD, or UNSURE. Do not agonize over borderline cases — that is what stage two is for. Be decisive on clear-cut cases, and honest about unclear ones.
 
 {category_hint}
-{financial_hint}
 
-Evaluate the email across three dimensions:
-1. SENDER TYPE: A real person, an automated system, a newsletter, a service notification, or spam?
-2. URGENCY & ACTION: Does it require a reply or action, or have a deadline? (Compare Message Date vs Current Date — if a deadline or limited-time offer has already passed, it is no longer actionable).
-3. RELEVANCE: Is it tied to personal life, finances, health, legal matters, or active commitments — even if no action is needed? (Note: The older an email is relative to today, the lower its ongoing relevance or actionability — except for historical financial/tax/legal records, statements, or receipts which retain archiving value).
+First, identify the email's language for "detected_language" — do this regardless of anything else below.
 
-LANGUAGE HANDLING: The user only reads {languages_str}. Base the triage decision on the email's actual content regardless of language — never default to DELETE or ATTENTION merely because the language is unfamiliar. Always write "summary" and "reason" IN ENGLISH. Set "detected_language" to the language the email is written in. Set "translated_subject" to an English translation of the subject if it is not already in {languages_str}, otherwise leave it as an empty string.
+Then apply these checks:
 
-DECISION CRITERIA:
-- Use "ATTENTION" for: personal emails, bills or payments due, appointments or reminders, security alerts, account changes, receipts, medical/tax/legal notices, shipping requiring action, anything with a deadline or requiring a reply — AND, importantly, any email reporting a specific dollar amount tied to a real account event (a transfer, deposit, withdrawal, or payment made/received), even when nothing needs to be done. Information about money that actually moved in an account is ATTENTION-worthy purely because it happened, not because it's actionable.
-- Use "DELETE" for: newsletters, marketing with no expiring offer, expired promotions or deals where the deadline has passed relative to Current Date (Today), social media digests, routine shipping notifications already delivered, automated digests with no action required, read receipts, and generic status updates that contain no dollar amounts, deadlines, or account-specific figures.
+KEEP if the email clearly matches ANY of:
+  MONEY — a specific dollar amount tied to a bill (balance, minimum payment, amount due, due date) or to money that already moved (transfer, deposit, withdrawal, payment sent/received).
+  DEADLINE — requires a reply, or has an appointment/deadline that has NOT yet passed (compare Message Date and any stated deadline to Current Date).
+  NOTICE — a security alert, account change, receipt, or medical/tax/legal notice.
+  PROMO — a promotion or deal with an expiration date that has NOT yet passed.
+  Set "matched_rule" to whichever one applied.
 
-PRIORITY WHEN SIGNALS CONFLICT: If the Gmail category hint above suggests one lean but the email's actual content matches an ATTENTION case in DECISION CRITERIA (especially a financial-detail hint above), the content-based DECISION CRITERIA always wins — category hints are defaults, not overrides.
+DISCARD if the email is clearly generic marketing, a newsletter, a social/forum digest, an expired promotion, or a routine automated status update, with NONE of the signals above. Set "matched_rule" to "JUNK".
+
+UNSURE if it doesn't cleanly fit KEEP or DISCARD — e.g. a borderline promotional email, an old but maybe-still-relevant update, an email that merely SOUNDS like it's from a real person but doesn't clearly match another KEEP rule (sender identity can be spoofed, so it needs a closer look), or anything else needing more judgment about the sender or the tone of the message. Set "matched_rule" to "NONE". When genuinely in doubt, choose UNSURE rather than guessing — a second, more careful pass will look at it.
 
 [EMAIL CONTENT START]
 From: {sender}
@@ -123,13 +102,59 @@ Body: {body.strip()}
 
 IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
 {{
+  "detected_language": "language the email is written in, e.g. Chinese, English, Spanish",
+  "verdict": "KEEP" or "DISCARD" or "UNSURE",
+  "matched_rule": "MONEY" or "DEADLINE" or "NOTICE" or "PROMO" or "JUNK" or "NONE",
+  "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing, 1 = no personal relevance"
+}}"""
+    return prompt
+
+
+def build_stage2_prompt(sender, date, subject, body, category_hint=" ", user_name="", reply_to=""):
+    today_now = datetime.now().strftime("%Y-%m-%d")
+    name_line = (
+        f'The user\'s name is "{user_name}" — check whether the email addresses '
+        f"them personally (e.g. \"Hi {user_name}\") as one signal of genuine "
+        f"correspondence rather than a mass sales pitch."
+        if user_name else
+        "The user's name is not provided, so skip that signal."
+    )
+    reply_to_line = (
+        f'Reply-To: {reply_to} — compare this to the From address. If Reply-To '
+        f"points somewhere different and looks like a business/support/sales/"
+        f"no-reply alias, that undercuts the PERSON signal below — it's a sign "
+        f"of a business or marketing account dressed up with a personal-looking "
+        f"sender name, and should count AGAINST relevance even if the From name "
+        f"looks like a real person."
+        if reply_to else
+        "No separate Reply-To header was present."
+    )
+    prompt = f"""You are STAGE TWO of a two-stage email triage pipeline. Stage one already checked the clear-cut rules (bills, deadlines, notices, valid promos, obvious junk) and could NOT confidently decide — that is why this email reached you. Decide ATTENTION (keep) or DELETE (trash) using judgment.
+
+{category_hint}
+
+Weigh these signals together:
+- Gmail category lean given above (a starting point, not a rule).
+- RECENCY: how old is this relative to Current Date? Older, stale-looking emails lean DELETE.
+- {name_line}
+- PERSON: Does the sender use a real personal name in the "From" field, or a generic/no-reply/automated-looking address? {reply_to_line}
+- Does the body read like genuine, specific correspondence, or like a templated sales pitch / mass marketing (generic greeting, no specific details about the user, calls to "buy now" / "shop now" / "click here")?
+
+In "reason", name which of these signals mattered most for this email — that record is meant to help the user spot patterns and turn them into new explicit stage-one rules later.
+
+[EMAIL CONTENT START]
+From: {sender}
+Message Date: {date}
+Current Date (Today): {today_now}
+Subject: {subject}
+Body: {body.strip()}
+[EMAIL CONTENT END]
+
+IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
+{{
+  "reason": "which signals mattered most and why, written in English",
   "decision": "{VALID_DECISIONS[0]}" or "{VALID_DECISIONS[1]}",
   "summary": "1 sentence summary, written in English",
-  "sender_type": "short label, e.g. person / automated service / newsletter / financial institution / spam",
-  "action_required": "short description of what action is needed, or empty string if none",
-  "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing (e.g. a completed transaction), 1 = no personal relevance, safe to ignore",
-  "reason": "explanation, written in English",
-  "detected_language": "language the email is written in, e.g. Chinese, English, Spanish",
-  "translated_subject": "English translation of the subject if not already in English/Spanish, else empty string"
+  "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing, 1 = no personal relevance"
 }}"""
     return prompt

@@ -51,6 +51,53 @@ The hypothesis here is that for well-defined tasks with large volumes of data �
 email triage — a deterministic, function-call model outperforms an open-ended agent
 both in speed and reliability on modest hardware.
 
+### Two-Stage Triage: Right-Sizing the Task for the Model
+
+Triage runs as **two separate LLM calls**, not one — a change made specifically to
+get better results out of small models.
+
+The original single-prompt design asked the model to do several things in one pass:
+identify the language, check five different objective rules (bill? deadline? notice?
+promo? real person?), weigh soft signals like sender identity and tone, *and* commit
+to a final verdict — all in one shot. In testing, this was where small models broke
+down. A 3B model correctly reasoned that an email failed every rule, then talked
+itself out of its own conclusion anyway because a promotional detail in the body kept
+pulling it toward the wrong answer. The failure wasn't the model's language skill or
+its knowledge of the rules — it was asking one pass to both apply several rules *and*
+arbitrate between them under conflicting pressure, which turns out to be the weakest
+link for models at this size.
+
+The fix: split detection from judgment, into two narrower calls.
+
+- **Stage 1** is a fast, cheap classifier. Its only job is to check an email against
+  a short list of *objective, checkable* rules — a dollar amount tied to a bill, an
+  unexpired deadline, a security/legal/tax notice, a still-valid promotion — and sort
+  the email into `KEEP`, `DISCARD`, or `UNSURE`. No judgment calls, no weighing
+  competing signals. Most emails resolve here.
+- **Stage 2** only runs for the `UNSURE` survivors — the genuinely ambiguous minority.
+  This is where the soft, harder-to-verify judgment call lives: how recent is this,
+  does it address the user by name, does the sender's `Reply-To` undercut a
+  personal-looking `From` name, does the body read like real correspondence or a
+  sales pitch. Only here does the model get asked to weigh several fuzzy signals
+  against each other — and only on emails where that's actually necessary.
+
+Two things fall out of this that are also enforced deterministically in code rather
+than left to the model: language detection isn't trusted to also drive the final
+decision (stage 1 only *reports* the detected language; `mailagent.py` enforces the
+DELETE rule itself, so a model can't reason its way past a fact it already stated),
+and a personal-*sounding* sender is deliberately excluded from stage 1's KEEP list —
+sender identity can be spoofed via `Reply-To`, so it's held back for stage 2's closer,
+cross-referenced look rather than getting a fast, unverified pass.
+
+The underlying idea generalizes: **narrow, single-purpose classification is where
+small models are reliable; multi-factor arbitration in a single pass is where they
+aren't.** Two stages was the minimum split needed to fix the failure mode observed —
+if a smaller model (this project was tested down to a 1.2B) starts showing the same
+kind of "correct rule, wrong final answer" behavior even within a single stage, the
+plan is to split further — e.g. separating language detection from rule-matching, or
+giving stage 2's judgment signals (recency, sender identity, tone) their own passes
+— rather than trying to fix it by writing a more emphatic prompt.
+
 ---
 
 A second goal is for the agent to **get better the longer it runs.** The current version
@@ -108,9 +155,19 @@ Once enough corrections accumulate, they can be used to:
 3. Create triage labels in Gmail if they don't exist yet
 4. Find the 10 oldest inbox emails not yet labelled by this agent
 5. For each email, print one compact progress line as it finishes:
-     - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip LLM
-     - Otherwise extract subject, sender, date, body, and Gmail category hint
-     - Ask the LLM to decide: DELETE or ATTENTION, with highlights and action
+     - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip both LLM stages
+     - Otherwise extract subject, sender, Reply-To, date, body, and Gmail category hint
+     - STAGE 1 (always runs): ask the LLM to sort the email into KEEP / DISCARD /
+       UNSURE against objective rules (money, deadline, notice, valid promo), and
+       report the email's detected language
+       · detected_language not English/Spanish → DELETE, enforced in code,
+         regardless of the model's verdict — STAGE 2 is skipped
+       · KEEP    → ATTENTION, reason generated from the matched rule
+       · DISCARD → DELETE, reason generated in code
+       · UNSURE  → falls through to STAGE 2
+     - STAGE 2 (only for UNSURE survivors): ask the LLM to weigh softer signals —
+       recency, addressed by name, sender identity vs. Reply-To, sales-pitch tone —
+       and decide DELETE or ATTENTION with its own reasoning
      - Apply the matching Gmail label
        · DELETE    → archived (removed from INBOX)
        · ATTENTION → label applied, stays in INBOX
@@ -127,6 +184,10 @@ Once enough corrections accumulate, they can be used to:
      x  Exit
 ```
 
+See [Two-Stage Triage: Right-Sizing the Task for the Model](#two-stage-triage-right-sizing-the-task-for-the-model)
+above for why triage is split into two LLM calls instead of one, and what
+determines whether an email needs both.
+
 Emails labelled `1-ToDelete` are **not moved automatically**. Option 2 asks for
 confirmation before trashing — you stay in control every run. Only DELETE emails
 are archived out of the inbox; ATTENTION and ERROR emails remain visible.
@@ -137,17 +198,31 @@ are archived out of the inbox; ATTENTION and ERROR emails remain visible.
 
 Defined in `LABEL_NAMES` at the top of `mailagent.py`:
 
-| Key         | Gmail Label       | Icon | Inbox | Criteria |
+| Key         | Gmail Label       | Icon | Inbox | Meaning |
 |-------------|-------------------|------|-------|----------|
-| `DELETE`    | `1-ToDelete`      | 🗑️   | Archived | Newsletters, marketing, shipping alerts, social media, promotions |
-| `ATTENTION` | `1-NeedAttention` | 👁️   | Kept  | Personal emails, receipts, medical, tax, bank alerts, legal notices |
-| `ERROR`     | `1-ProcessError`  | ⚙️   | Kept  | LLM could not parse the email or returned an invalid decision — review manually |
+| `DELETE`    | `1-ToDelete`      | 🗑️   | Archived | Newsletters, marketing, shipping alerts, social media, expired promotions, non-English/Spanish spam — see the stage table below for the exact rules |
+| `ATTENTION` | `1-NeedAttention` | 👁️   | Kept  | Bills, deadlines, notices, valid promos, genuine personal correspondence — see the stage table below for the exact rules |
+| `ERROR`     | `1-ProcessError`  | ⚙️   | Kept  | Either stage's LLM call failed, or the response couldn't be parsed / returned an invalid value — review manually |
 
 Labels are created automatically on first run. The `1-` prefix makes them sort
 to the top of your Gmail label list.
 
 To add or rename categories, edit only the `LABEL_NAMES` dict — everything else
 (prompt, validation, metrics, report) derives from it automatically.
+
+### Stage 1 rules and stage 2 signals
+
+The actual triage criteria live in `relevancy_prompt.py`, in the two prompt builders.
+Quick reference:
+
+| Stage | Checks | Outcome |
+|-------|--------|---------|
+| 1 — `build_stage1_prompt` | MONEY (bill/payment or account activity with a dollar amount), DEADLINE (unexpired appointment or reply needed), NOTICE (security/account/receipt/tax/legal), PROMO (unexpired offer) | `KEEP` → ATTENTION, `DISCARD` (generic marketing/newsletter/digest/expired promo/automated status) → DELETE, `UNSURE` → escalates to stage 2 |
+| 1 — language (code-enforced) | `detected_language` reported by stage 1, checked against `USER_LANGUAGES` in code | Non-English/Spanish → DELETE immediately, stage 2 skipped |
+| 2 — `build_stage2_prompt` | Gmail category lean, recency, addressed by name (`USER_NAME`), PERSON (real name in `From` vs. a `Reply-To` that points to a business/support/no-reply alias), sales-pitch tone | Judgment call → ATTENTION or DELETE |
+
+Both prompt builders return `matched_rule`/`reason` text so every decision in the
+Detailed Results report traces back to which rule or signal drove it.
 
 ---
 
@@ -170,6 +245,7 @@ All settings live in `config.py` and `.env`:
 | Setting        | Description                                     |
 |----------------|-------------------------------------------------|
 | `EMAIL_ACCOUNT`| Gmail address to process                        |
+| `USER_NAME`    | Your name — stage 2 checks whether an ambiguous email addresses you personally as a genuine-correspondence signal. Optional; that signal is skipped if unset. |
 | `OLLAMA_MODEL` | Model name (default: `qwen2.5:3b-instruct`, recommended) |
 | `OLLAMA_HOST`  | Ollama server URL                               |
 
@@ -206,6 +282,15 @@ Emails Processed : 10
 Avg Inference    : 22.1s
 Total Time       : 132.6s
 ========================================
+```
+
+`⏱` on each line is per-email wall time — one LLM call for emails stage 1 resolves
+outright (`KEEP`/`DISCARD`), two calls back-to-back for anything stage 1 marked
+`UNSURE` and had to escalate to stage 2. `💡` in the Detailed Results section below
+explains which stage/rule made the call, so you can see at a glance how much of a
+batch stage 1 is resolving on its own.
+
+```
 ========================================
       DETAILED RESULTS
 ========================================
@@ -359,6 +444,7 @@ Create `secrets/.env` with:
 
 ```
 EMAIL_ACCOUNT=your-email@gmail.com
+USER_NAME=Your Name
 OLLAMA_MODEL=qwen2.5:3b-instruct
 OLLAMA_HOST=http://localhost:11434
 ```
