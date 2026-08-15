@@ -48,12 +48,12 @@ mailAgent.py: triage_and_label_emails()   [main entry, run via __main__]
        ├─ load_contacts() / trusted-sender short-circuit → ATTENTION w/o calling LLM
        ├─ clean_text() (BeautifulSoup)              → strip HTML to plain text
        ├─ relevancy_prompt.get_category_hint()       → Gmail category → hint string
-       ├─ relevancy_prompt.get_financial_hint()      → detect $amount + bill OR account-activity keyword
-       ├─ relevancy_prompt.build_triage_prompt()     → full prompt string
-       ├─ config.ollama_client.chat(...)             → local LLM call (think=False, format=json)
-       ├─ parse JSON response → decision/summary/reason/etc.
-       └─ service.users().messages().modify(...)     → apply Gmail label
-  └─ post-batch menu (1/2/3/4/x) → loops back into triage_and_label_emails() on "1"
+  ├─ relevancy_prompt.build_stage1_prompt()      → first-pass triage prompt
+  ├─ relevancy_prompt.build_stage2_prompt()      → ambiguous-case judgment prompt
+  ├─ config.ollama_client.chat(...)             → local LLM call (think=False, format=json)
+  ├─ parse JSON response → decision/summary/reason/etc.
+  └─ service.users().messages().modify(...)     → apply Gmail label
+  └─ post-batch menu (R/T/A/L/x) → loops back into triage_and_label_emails() on "R"
 ```
 
 ## Key conventions / gotchas
@@ -77,11 +77,7 @@ mailAgent.py: triage_and_label_emails()   [main entry, run via __main__]
   `mailAgent.py`). Truncated to 1500 chars before prompting.
 - Trusted senders (`secrets/contacts.yml`, `load_contacts()`) always resolve
   to ATTENTION, bypassing the LLM.
-- Financial hint needs dollar amount + keyword match, not amount alone.
-  `BILL_KEYWORDS` (balance/due date/minimum payment = owed) and
-  `ACCOUNT_ACTIVITY_KEYWORDS` (transfer/deposit/Zelle/Venmo = already moved)
-  are separate buckets; either forces ATTENTION. New phrasing → pick the
-  correct bucket.
+- Financial signals are handled by the MONEY rule in Stage 1 (detects dollar amounts tied to bills or account activity) — this is now a prompt-based rule rather than a pre-prompt Python filter.
 - DELETE archives immediately (removes from INBOX); actual Trash only via
   menu option 2 + confirmation. Don't collapse this two-step safety behavior.
 - Ctrl+C uses `threading.Event` (`_stop`), checked between emails/menu loops
