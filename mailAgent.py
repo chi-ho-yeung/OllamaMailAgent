@@ -149,6 +149,21 @@ def _decode_mime_header(raw_header):
         return raw_header
 
 
+# Zero-width / invisible characters marketing platforms pad emails with to
+# defeat spam-filter "too much whitespace" heuristics — most commonly
+# COMBINING GRAPHEME JOINER (U+034F) and SOFT HYPHEN (U+00AD), often
+# repeated hundreds of times separated by ordinary spaces. They're invisible
+# in an email client but render as walls of spaced-out glyphs/boxes in a
+# terminal, so strip them before any other cleanup.
+_INVISIBLE_CHARS_RE = re.compile(
+    "[\u034f\u00ad\u200b\u200c\u200d\u2060\ufeff\u180e]"
+)
+# After stripping invisible chars, what's left of those padding blocks is
+# runs of plain spaces (and blank lines) — collapse those down too.
+_MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
+_MULTI_BLANK_LINE_RE = re.compile(r"\n\s*\n\s*\n+")
+
+
 def clean_text(text_body):
     if not text_body:
         return ""
@@ -160,7 +175,14 @@ def clean_text(text_body):
     # truncation length.
     for tag in soup(["style", "script"]):
         tag.decompose()
-    return soup.get_text(separator="\n").strip()
+    text = soup.get_text(separator="\n")
+    text = _INVISIBLE_CHARS_RE.sub("", text)
+    text = _MULTI_SPACE_RE.sub(" ", text)
+    # Collapse each line's leading/trailing space left over after stripping
+    # invisible chars, then collapse 3+ blank lines down to a single blank line.
+    text = "\n".join(line.strip() for line in text.split("\n"))
+    text = _MULTI_BLANK_LINE_RE.sub("\n\n", text)
+    return text.strip()
 
 
 def load_contacts():
@@ -272,6 +294,163 @@ def fetch_untagged_emails(service, label_ids, batch_size):
             break
 
     return pool
+
+
+def get_gmail_link(msg_id):
+    """Build a direct link to open this message in the Gmail web UI.
+    '#all' works whether or not the message is still in the INBOX
+    (e.g. after being archived by the DELETE label)."""
+    return f"https://mail.google.com/mail/u/0/#all/{msg_id}"
+
+
+def list_gmail_labels(service, exclude_names=None):
+    """Return [(id, name), ...] of the user's own custom Gmail labels/folders,
+    sorted by name — suitable as a "move to" target list.
+
+    Filters out:
+    - All Gmail SYSTEM labels (type == "system"): INBOX, SENT, CATEGORY_*,
+      YELLOW_STAR, IMPORTANT, SPAM, TRASH, DRAFT, CHAT, UNREAD, STARRED,
+      etc. None of these are meaningful "move this email to a folder"
+      destinations — CATEGORY_* in particular is Gmail's own auto-classifier
+      and re-adding it does nothing useful.
+    - This app's own triage labels (1-ToDelete / 1-NeedAttention /
+      1-ProcessError), passed in via `exclude_names` — showing them here
+      would just duplicate the L / L.# quick-toggle already on this menu.
+    """
+    try:
+        result = call_with_timeout(service.users().labels().list(userId="me").execute)
+    except Exception as e:
+        print(f"  ⚠️  Could not fetch labels: {e}")
+        return []
+    exclude_names = exclude_names or set()
+    labels = [
+        l for l in result.get("labels", [])
+        if l.get("type") == "user" and l["name"] not in exclude_names
+    ]
+    labels.sort(key=lambda l: l["name"].lower())
+    return [(l["id"], l["name"]) for l in labels]
+
+
+def show_message_detail(service, e, label_ids, delete_ids):
+    """
+    Full detail view for one triaged message (invoked via M / M.#): shows a
+    Gmail link, the extracted body text, and a small submenu to either flip
+    the ToDelete/NeedAttention label (same quick-toggle as the top-level L
+    option) or move the message to any other Gmail label. `delete_ids` is
+    the batch's live list and is mutated in place so the Trash count on the
+    main menu stays accurate after returning.
+    """
+    while True:
+        name, addr = parse_sender(e["sender"])
+        current_label_name = e.get("custom_label_name") or LABEL_NAMES.get(e["decision"], e["decision"])
+
+        print("\n" + "=" * 60)
+        print("      MESSAGE DETAIL")
+        print("=" * 60)
+        print(f"From          : {name} <{addr}>" if name else f"From          : {addr}")
+        print(f"Subject       : {e['subject']}")
+        print(f"Date          : {e['date']}")
+        if e.get("category"):
+            print(f"Gmail category: {e['category']}")
+        print(f"Current label : {current_label_name}")
+        if e.get("relevance_score") not in (None, "?"):
+            print(f"Relevance     : {e['relevance_score']}/5")
+        if e.get("lang_note"):
+            print(e["lang_note"])
+        if e.get("summary"):
+            print(f"Summary       : {e['summary']}")
+        if e.get("reason"):
+            print(f"Reason        : {e['reason']}")
+        print(f"Gmail link    : {get_gmail_link(e['id'])}")
+        print("-" * 60)
+        body_preview = (e.get("body_preview") or "").strip()
+        if body_preview:
+            print(body_preview)
+        else:
+            print("(No message body extracted.)")
+        print("-" * 60)
+
+        old_decision = e["decision"]
+        toggle_target = "ATTENTION" if old_decision == "DELETE" else "DELETE"
+        print("\nWhat would you like to do with this message?")
+        print(f"  L  Correct label (flip {LABEL_NAMES.get(old_decision, old_decision)} → {LABEL_NAMES[toggle_target]})")
+        print("  C  Choose a different Gmail label")
+        print("  B  Back to list")
+        try:
+            sub_choice = input("\n  > ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            sub_choice = "b"
+
+        if sub_choice == "l":
+            new_decision = toggle_target
+            old_label_id = e.get("custom_label_id") or label_ids[old_decision]
+            new_label_id = label_ids[new_decision]
+            try:
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=e["id"],
+                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
+                    ).execute
+                )
+                if new_decision == "DELETE":
+                    if e["id"] not in delete_ids:
+                        delete_ids.append(e["id"])
+                elif e["id"] in delete_ids:
+                    delete_ids.remove(e["id"])
+                e["decision"] = new_decision
+                e["custom_label_id"] = None
+                e["custom_label_name"] = None
+                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}\n")
+            except Exception as ex:
+                print(f"  ⚠️  Failed to update label: {ex}\n")
+
+        elif sub_choice == "c":
+            labels = list_gmail_labels(service, exclude_names=set(LABEL_NAMES.values()))
+            if not labels:
+                print("  No labels available.\n")
+                continue
+            print("\n  Choose a label to apply:")
+            for i, (lid, lname) in enumerate(labels, start=1):
+                print(f"  [{i}] {lname}")
+            print("  (Enter number, or blank to cancel)")
+            try:
+                sel = input("\n  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sel = ""
+            if not sel:
+                print("  Cancelled.\n")
+                continue
+            try:
+                sel_idx = int(sel) - 1
+                if not (0 <= sel_idx < len(labels)):
+                    raise ValueError
+            except ValueError:
+                print("  Invalid selection.\n")
+                continue
+
+            new_label_id, new_label_name = labels[sel_idx]
+            old_label_id = e.get("custom_label_id") or label_ids.get(e["decision"])
+            remove_ids = [old_label_id] if old_label_id else []
+            try:
+                call_with_timeout(
+                    service.users().messages().modify(
+                        userId="me", id=e["id"],
+                        body={"addLabelIds": [new_label_id], "removeLabelIds": remove_ids}
+                    ).execute
+                )
+                if e["decision"] == "DELETE" and e["id"] in delete_ids:
+                    delete_ids.remove(e["id"])
+                e["custom_label_id"] = new_label_id
+                e["custom_label_name"] = new_label_name
+                print(f"\n  ✅ Moved to label: {new_label_name}\n")
+            except Exception as ex:
+                print(f"  ⚠️  Failed to apply label: {ex}\n")
+
+        elif sub_choice == "b" or sub_choice == "":
+            return
+
+        else:
+            print("  Unrecognised option. Please choose L, C, or B.\n")
 
 
 def triage_and_label_emails():
@@ -404,6 +583,9 @@ def triage_and_label_emails():
             "reason": "",
             "trusted": bool(trusted_hint),
             "lang_note": "",
+            "body_preview": "",
+            "custom_label_id": None,
+            "custom_label_name": None,
         }
         batch_senders.append(entry)
         # Extract body
@@ -448,6 +630,10 @@ def triage_and_label_emails():
             body = html_fallback
         else:
             body = plain_body
+
+        # Keep a longer, unsliced-for-the-LLM copy for the M.# detail view —
+        # the 1500-char slice below is tuned for prompt budget, not readability.
+        entry["body_preview"] = body[:5000]
 
         body = body[:1500]
 
@@ -624,7 +810,13 @@ def triage_and_label_emails():
         group_items.sort(key=_relevance_sort_key)
         grouped_entries.extend(group_items)
 
-    if grouped_entries:
+    def print_detailed_results():
+        """Reprints the numbered DETAILED RESULTS list — called once after the
+        batch finishes, and again whenever the user backs out of the M.#
+        message-detail view so the numbering stays visible/current (labels may
+        have changed via L/C while in that view)."""
+        if not grouped_entries:
+            return
         print("=" * 40)
         print("      DETAILED RESULTS")
         print("=" * 40)
@@ -635,10 +827,11 @@ def triage_and_label_emails():
                 header = f" {LABEL_NAMES[current_group]} "
                 print(f"\n{header:─^40}")
             cat_str = f"[{e['category']}] " if e.get("category") else ""
+            label_display = e.get("custom_label_name") or LABEL_NAMES[e["decision"]]
             print(f"[{i}/{len(grouped_entries)}] {e['date']} {cat_str}{e['sender'].replace('\\n', ' ').replace('\\t', ' ').strip()[:60]}")
             print(f"  📝 {e['subject']}")
             elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
-            print(f"  {GROUP_ICONS[e['decision']]}{LABEL_NAMES[e['decision']]} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
+            print(f"  {GROUP_ICONS[e['decision']]}{label_display} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
             if e.get("lang_note"):
                 print(f"  {e['lang_note']}")
             if e.get("summary"):
@@ -647,6 +840,8 @@ def triage_and_label_emails():
                 print(f"  💡 {e['reason']}")
             print("-" * 60)
         print()
+
+    print_detailed_results()
 
     # ── Summary report ────────────────────────────────────────────────────────
     total_processed = sum(metrics[k] for k in LABEL_NAMES)
@@ -675,6 +870,7 @@ def triage_and_label_emails():
             print(f"  T  Move {delete_count} marked email(s) to Trash")
         print("  A  Add a sender to contact list (A.# to specify a given message number)")
         print("  L  Correct a label (L.# to specify a given message number)")
+        print("  M  View message details (M.# to specify a given message number)")
         print("  x  Exit")
         try:
             choice = input("\n> ").strip().lower()
@@ -792,7 +988,7 @@ def triage_and_label_emails():
                 e = grouped_entries[sel_idx]
                 old_decision = e["decision"]
                 new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
-                old_label_id = label_ids[old_decision]
+                old_label_id = e.get("custom_label_id") or label_ids[old_decision]
                 new_label_id = label_ids[new_decision]
 
                 call_with_timeout(
@@ -811,6 +1007,8 @@ def triage_and_label_emails():
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
                 print(f"  📝 Label updated.\n")
                 e["decision"] = new_decision
+                e["custom_label_id"] = None
+                e["custom_label_name"] = None
 
             except (IndexError, ValueError):
                 print("  Invalid selection format. Use 'L' to select from list or 'L.N' (e.g., L.3) for direct selection.\n")
@@ -846,7 +1044,7 @@ def triage_and_label_emails():
             e = grouped_entries[sel_idx]
             old_decision = e["decision"]
             new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
-            old_label_id = label_ids[old_decision]
+            old_label_id = e.get("custom_label_id") or label_ids[old_decision]
             new_label_id = label_ids[new_decision]
 
             try:
@@ -866,15 +1064,64 @@ def triage_and_label_emails():
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
                 print(f"  📝 Label updated.\n")
                 e["decision"] = new_decision
+                e["custom_label_id"] = None
+                e["custom_label_name"] = None
             except Exception as ex:
                 print(f"  ⚠️  Failed to update label: {ex}\n")
+
+        # Handle 'm' for View message details
+        elif choice.startswith("m."):
+            try:
+                index_str = choice.split('.', 1)[1]
+                sel_idx = int(index_str) - 1
+                if not (0 <= sel_idx < len(grouped_entries)):
+                    raise ValueError("Index out of bounds")
+            except (IndexError, ValueError):
+                print("  Invalid selection format. Use 'M' to select from list or 'M.N' (e.g., M.3) for direct selection.\n")
+                continue
+
+            show_message_detail(service, grouped_entries[sel_idx], label_ids, delete_ids)
+            delete_count = len(delete_ids)
+            print_detailed_results()
+
+        elif choice == "m": # If it was just 'm', proceed with interactive selection
+            if not grouped_entries:
+                print("  No messages available in this batch.\n")
+                continue
+            print("\n  Which message would you like to view?")
+            for i, e in enumerate(grouped_entries, start=1):
+                _, addr = parse_sender(e["sender"])
+                icon = "🗑️ " if e["decision"] == "DELETE" else ("👁️ " if e["decision"] == "ATTENTION" else "⚙️ ")
+                label_display = e.get("custom_label_name") or LABEL_NAMES[e["decision"]]
+                print(f"  [{i}/{len(grouped_entries)}] {icon} {label_display}")
+                print(f"        From   : {addr}")
+                print(f"        Subject: {e['subject']}")
+            print("  (Enter number, or blank to cancel)")
+            try:
+                sel = input("\n  > ").strip()
+            except (EOFError, KeyboardInterrupt):
+                sel = ""
+            if not sel:
+                print("  Cancelled.\n")
+                continue
+            try:
+                sel_idx = int(sel) - 1
+                if not (0 <= sel_idx < len(grouped_entries)):
+                    raise ValueError
+            except ValueError:
+                print("  Invalid selection.\n")
+                continue
+
+            show_message_detail(service, grouped_entries[sel_idx], label_ids, delete_ids)
+            delete_count = len(delete_ids)
+            print_detailed_results()
 
         elif choice == "x" or choice == "":
             print("👋 Bye!")
             break
 
         else:
-            print("  Unrecognised option. Please choose R, T, A, L, or x.\n")
+            print("  Unrecognised option. Please choose R, T, A, L, M, or x.\n")
 
 
 if __name__ == "__main__":
