@@ -264,12 +264,40 @@ python mailagent.py
 ```
 
 The agent prints one compact progress line per email as it's processed, then a
-performance report, a full Detailed Results breakdown, and the post-batch menu:
+full Detailed Results breakdown, a performance report, and the post-batch menu:
 
 ```
-[1/10] 07/29/2026 [Promotions] From: "Citi Double Cash® Card" <citicards@e... | 📝 Grow your portfolio your way | ⏱ 4.5s
-[2/10] 05/19/2026 [Updates] From: "Amazon.com" <auto-confirm@amazon.com> | 📝 Ordered: "FUMAX Shower Door Hooks 10..." | ⏱ 26.9s
-[3/10] 05/29/2026 [Personal] From: billing@acme.com | 📝 Your invoice #4821 is ready | ⏱ 21.3s
+[1/10] 07/29/26 [Promotions] "Citi Double Cash® Card" <citicards@e... | 📝 Grow your portfolio your way | ⏱ 4.5s
+[2/10] 05/19/26 [Updates] "Amazon.com" <auto-confirm@amazon.com> | 📝 Ordered: "FUMAX Shower Door Hooks 10..." | ⏱ 26.9s
+[3/10] 05/29/26 [Personal] billing@acme.com | 📝 Your invoice #4821 is ready | ⏱ 21.3s
+...
+
+========================================
+      DETAILED RESULTS
+========================================
+
+──────────── 1-NeedAttention ────────────
+[1/10] 05/29/26 [Personal] billing@acme.com
+  📝 Your invoice #4821 is ready
+  👁️ 1-NeedAttention | ⏱ 21.3s | 📊 Rel: 4/5
+  💬 Invoice #4821 for $149.00 due June 5 with PDF attached.
+  💡 Bill with a deadline requiring action — kept in inbox.
+------------------------------------------------------------
+
+──────────── 1-ProcessError ────────────
+[4/10] 07/27/26 some-sender@example.com
+  📝 A subject the model couldn't parse
+  ⚙️ 1-ProcessError | ⏱ 18.2s | 📊 Rel: ?/5
+  💡 Could not parse model response.
+------------------------------------------------------------
+
+──────────── 1-ToDelete ────────────
+[5/10] 05/19/26 [Updates] "Amazon.com" <auto-confirm@amazon.com>
+  📝 Ordered: "FUMAX Shower Door Hooks 10..."
+  🗑️ 1-ToDelete | ⏱ 26.9s | 📊 Rel: 1/5
+  💬 Amazon shipping confirmation for a non-actionable, already-delivered order.
+  💡 Routine delivery confirmation with no deadlines or follow-up action needed.
+------------------------------------------------------------
 ...
 
 ========================================
@@ -282,42 +310,6 @@ Emails Processed : 10
 Avg Inference    : 22.1s
 Total Time       : 132.6s
 ========================================
-```
-
-`⏱` on each line is per-email wall time — one LLM call for emails stage 1 resolves
-outright (`KEEP`/`DISCARD`), two calls back-to-back for anything stage 1 marked
-`UNSURE` and had to escalate to stage 2. `💡` in the Detailed Results section below
-explains which stage/rule made the call, so you can see at a glance how much of a
-batch stage 1 is resolving on its own.
-
-```
-========================================
-      DETAILED RESULTS
-========================================
-
-──────────── 1-NeedAttention ────────────
-[1/10] 05/29/2026 [Personal] From: billing@acme.com
-  📝 Your invoice #4821 is ready
-  👁️ 1-NeedAttention | ⏱ 21.3s | 📊 Rel: 4/5
-  💬 Invoice #4821 for $149.00 due June 5 with PDF attached.
-  💡 Bill with a deadline requiring action — kept in inbox.
-------------------------------------------------------------
-
-──────────── 1-ProcessError ────────────
-[4/10] 07/27/2026 From: some-sender@example.com
-  📝 A subject the model couldn't parse
-  ⚙️ 1-ProcessError | ⏱ 18.2s | 📊 Rel: ?/5
-  💡 Could not parse model response.
-------------------------------------------------------------
-
-──────────── 1-ToDelete ────────────
-[5/10] 05/19/2026 [Updates] From: "Amazon.com" <auto-confirm@amazon.com>
-  📝 Ordered: "FUMAX Shower Door Hooks 10..."
-  🗑️ 1-ToDelete | ⏱ 26.9s | 📊 Rel: 1/5
-  💬 Amazon shipping confirmation for a non-actionable, already-delivered order.
-  💡 Routine delivery confirmation with no deadlines or follow-up action needed.
-------------------------------------------------------------
-...
 
 What would you like to do?
   R  Run another batch

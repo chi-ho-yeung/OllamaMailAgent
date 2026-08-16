@@ -35,6 +35,7 @@ from relevancy_prompt import (
     build_stage2_prompt,
 )
 from bs4 import BeautifulSoup
+from email.utils import parsedate_to_datetime
 
 BATCH_SIZE = 10  # Number of oldest untagged emails to process per run
 
@@ -62,7 +63,7 @@ def print_progress(index, total, entry):
     max_sender_len = max(30, 55 - len(cat_str))
     elapsed = entry.get("elapsed")
     elapsed_str = f"{elapsed:.1f}s" if elapsed is not None else "skip"
-    print(f"[{index}/{total}] {entry['date']} {cat_str}From: {entry['sender'][:max_sender_len]} | 📝 {entry['subject'][:40]} | ⏱ {elapsed_str}")
+    print(f"[{index}/{total}] {entry['date']} {cat_str}{entry['sender'].replace('\\n', ' ').replace('\\t', ' ').strip()[:max_sender_len]} | 📝 {entry['subject'][:40]} | ⏱ {elapsed_str}")
 
 
 def call_with_timeout(fn, *args, timeout=30, **kwargs):
@@ -370,13 +371,13 @@ def triage_and_label_emails():
         subject = _decode_mime_header(msg.get("Subject")) or "No Subject"
         sender = _decode_mime_header(msg.get("From")) or "Unknown"
         reply_to = _decode_mime_header(msg.get("Reply-To"))
-        # Simplify date: remove time portion (e.g. Wed, 20 May 2026 21:26:42 +0000 -> Wed, 20 May 2026)
+        # Simplify date: remove time portion
         raw_date = msg.get("Date") or "Unknown"
-        # Convert "Wed, 20 May 2026 21:26:42 +0000" to "05/20/2026"
+        
         try:
-            from email.utils import parsedate_to_datetime
+            
             dt = parsedate_to_datetime(raw_date)
-            date = dt.strftime("%m/%d/%Y")
+            date = dt.strftime("%m/%d/%y")
         except Exception:
             date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
 
@@ -603,23 +604,6 @@ def triage_and_label_emails():
         print_progress(index, total_emails, entry)
 
 
-    # ── Summary report ────────────────────────────────────────────────────────
-    total_processed = sum(metrics[k] for k in LABEL_NAMES)
-    avg_ai_time = sum(ai_times) / len(ai_times) if ai_times else 0
-
-    print("\n" + "=" * 40)
-    print("      BATCH PERFORMANCE REPORT")
-    print("=" * 40)
-    print(f"Emails Processed : {total_processed}")
-    icons = {"DELETE": "🗑️ ", "ATTENTION": "👁️ ", "ERROR": "⚙️ "}
-    for key, name in LABEL_NAMES.items():
-        print(f"  {icons.get(key, '  ')}{name:<20}: {metrics[key]}")
-    if metrics["ERROR_FALLBACK"]:
-        print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
-    print(f"Avg Inference    : {avg_ai_time:.2f}s")
-    print(f"Total Time       : {sum(ai_times):.2f}s")
-    print("=" * 40 + "\n")
-
     # ── Detailed results ──────────────────────────────────────────────────────
     # Grouped NeedAttention → ProcessError → ToDelete (not processing order),
     # sorted within each group by relevance score (highest first; unscored —
@@ -651,7 +635,7 @@ def triage_and_label_emails():
                 header = f" {LABEL_NAMES[current_group]} "
                 print(f"\n{header:─^40}")
             cat_str = f"[{e['category']}] " if e.get("category") else ""
-            print(f"[{i}/{len(grouped_entries)}] {e['date']} {cat_str}From: {e['sender'][:60]}")
+            print(f"[{i}/{len(grouped_entries)}] {e['date']} {cat_str}{e['sender'].replace('\\n', ' ').replace('\\t', ' ').strip()[:60]}")
             print(f"  📝 {e['subject']}")
             elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
             print(f"  {GROUP_ICONS[e['decision']]}{LABEL_NAMES[e['decision']]} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
@@ -663,6 +647,23 @@ def triage_and_label_emails():
                 print(f"  💡 {e['reason']}")
             print("-" * 60)
         print()
+
+    # ── Summary report ────────────────────────────────────────────────────────
+    total_processed = sum(metrics[k] for k in LABEL_NAMES)
+    avg_ai_time = sum(ai_times) / len(ai_times) if ai_times else 0
+
+    print("\n" + "=" * 40)
+    print("      BATCH PERFORMANCE REPORT")
+    print("=" * 40)
+    print(f"Emails Processed : {total_processed}")
+    icons = {"DELETE": "🗑️ ", "ATTENTION": "👁️ ", "ERROR": "⚙️ "}
+    for key, name in LABEL_NAMES.items():
+        print(f"  {icons.get(key, '  ')}{name:<20}: {metrics[key]}")
+    if metrics["ERROR_FALLBACK"]:
+        print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
+    print(f"Avg Inference    : {avg_ai_time:.2f}s")
+    print(f"Total Time       : {sum(ai_times):.2f}s")
+    print("=" * 40 + "\n")
 
     # ── Post-batch menu ────────────────────────────────────────────────────────
     delete_count = metrics.get("DELETE", 0)
@@ -808,7 +809,7 @@ def triage_and_label_emails():
                     delete_count -= 1
 
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
-                print(f"  📝 Logged as correction for future learning.\n")
+                print(f"  📝 Label updated.\n")
                 e["decision"] = new_decision
 
             except (IndexError, ValueError):
@@ -863,7 +864,7 @@ def triage_and_label_emails():
                     delete_count -= 1
 
                 print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
-                print(f"  📝 Logged as correction for future learning.\n")
+                print(f"  📝 Label updated.\n")
                 e["decision"] = new_decision
             except Exception as ex:
                 print(f"  ⚠️  Failed to update label: {ex}\n")
