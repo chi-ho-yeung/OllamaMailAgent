@@ -442,6 +442,10 @@ def show_message_detail(service, e, label_ids, delete_ids):
                     delete_ids.remove(e["id"])
                 e["custom_label_id"] = new_label_id
                 e["custom_label_name"] = new_label_name
+                # Moved out of the app's triage system entirely — clear
+                # `decision` so this entry no longer matches any GROUP_ORDER
+                # key and drops out of the list on the next rebuild.
+                e["decision"] = None
                 print(f"\n  ✅ Moved to label: {new_label_name}\n")
             except Exception as ex:
                 print(f"  ⚠️  Failed to apply label: {ex}\n")
@@ -515,7 +519,9 @@ def triage_and_label_emails():
 
     metrics = {key: 0 for key in LABEL_NAMES}  # DELETE, ATTENTION, ERROR
     metrics["ERROR_FALLBACK"] = 0
-    ai_times = []
+    ai_times = []       # total per-email inference time (stage 1, or stage 1+2 combined)
+    stage1_times = []   # stage 1 call time only, recorded for every email
+    stage2_times = []   # stage 2 call time only, recorded only for UNSURE escalations
     delete_ids = []    # IDs labelled DELETE in this batch only
     batch_senders = [] # (msg_id, sender_raw, subject, decision) for each processed email
     trusted = load_contacts()
@@ -554,11 +560,13 @@ def triage_and_label_emails():
         raw_date = msg.get("Date") or "Unknown"
         
         try:
-            
             dt = parsedate_to_datetime(raw_date)
             date = dt.strftime("%m/%d/%y")
+            # Calculate days old for the LLM hint
+            days_old = (datetime.now() - dt).days
         except Exception:
             date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
+            days_old = None
 
         # Map Gmail category labels to human-readable hints (logic lives in relevancy_prompt.py)
         gmail_category, category_hint = get_category_hint(gmail_labels)
@@ -660,6 +668,7 @@ def triage_and_label_emails():
             subject=subject,
             body=body,
             category_hint=category_hint,
+            days_old=days_old,
         )
 
         summary = ""
@@ -676,6 +685,7 @@ def triage_and_label_emails():
         except Exception as e:
             elapsed = time.time() - ai_start
             ai_times.append(elapsed)
+            stage1_times.append(elapsed)
             entry["elapsed"] = elapsed
             entry["reason"] = f"Ollama error (stage 1): {e}"
             entry["decision"] = "ERROR"
@@ -691,6 +701,9 @@ def triage_and_label_emails():
                 entry["reason"] += f" | ⚠️ Could not apply error label: {label_err}"
             print_progress(index, total_emails, entry)
             continue
+
+        stage1_elapsed = time.time() - ai_start
+        stage1_times.append(stage1_elapsed)
 
         verdict = None
         matched_rule = "NONE"
@@ -738,8 +751,10 @@ def triage_and_label_emails():
                 user_name=USER_NAME,
                 reply_to=reply_to,
             )
+            stage2_start = time.time()
             try:
                 stage2_text = _run_ollama_chat(stage2_prompt)
+                stage2_times.append(time.time() - stage2_start)
                 stage2_result = _parse_json_response(stage2_text)
                 decision = stage2_result.get("decision", "").upper()
                 summary = stage2_result.get("summary", "")
@@ -752,6 +767,7 @@ def triage_and_label_emails():
             except KeyboardInterrupt:
                 raise
             except Exception as e:
+                stage2_times.append(time.time() - stage2_start)
                 decision = "ERROR"
                 reason = f"Stage 2 error/parse failure: {e}"
                 metrics["ERROR_FALLBACK"] += 1
@@ -815,6 +831,16 @@ def triage_and_label_emails():
         batch finishes, and again whenever the user backs out of the M.#
         message-detail view so the numbering stays visible/current (labels may
         have changed via L/C while in that view)."""
+        # Re-calculate grouped_entries to reflect any label changes made in detail view
+        nonlocal grouped_entries
+        grouped_entries = []
+        for key in GROUP_ORDER:
+            # Only include emails that still have one of our triage decisions.
+            # If a user moved it to a different label in detail view, it should disappear.
+            group_items = [e for e in batch_senders if e.get("decision") == key]
+            group_items.sort(key=_relevance_sort_key)
+            grouped_entries.extend(group_items)
+
         if not grouped_entries:
             return
         print("=" * 40)
@@ -845,7 +871,9 @@ def triage_and_label_emails():
 
     # ── Summary report ────────────────────────────────────────────────────────
     total_processed = sum(metrics[k] for k in LABEL_NAMES)
-    avg_ai_time = sum(ai_times) / len(ai_times) if ai_times else 0
+    avg_blended_time = sum(ai_times) / len(ai_times) if ai_times else 0
+    avg_stage1_time = sum(stage1_times) / len(stage1_times) if stage1_times else 0
+    avg_stage2_time = sum(stage2_times) / len(stage2_times) if stage2_times else 0
 
     print("\n" + "=" * 40)
     print("      BATCH PERFORMANCE REPORT")
@@ -856,7 +884,12 @@ def triage_and_label_emails():
         print(f"  {icons.get(key, '  ')}{name:<20}: {metrics[key]}")
     if metrics["ERROR_FALLBACK"]:
         print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
-    print(f"Avg Inference    : {avg_ai_time:.2f}s")
+    print(f"Avg Inference    : {avg_blended_time:.2f}s  (blended stage 1 / stage 1+2)")
+    print(f"  Stage 1 avg    : {avg_stage1_time:.2f}s  ({len(stage1_times)} calls)")
+    if stage2_times:
+        print(f"  Stage 2 avg    : {avg_stage2_time:.2f}s  ({len(stage2_times)} escalated to stage 2)")
+    else:
+        print(f"  Stage 2 avg    : n/a (no emails escalated to stage 2)")
     print(f"Total Time       : {sum(ai_times):.2f}s")
     print("=" * 40 + "\n")
 
@@ -869,7 +902,6 @@ def triage_and_label_emails():
         if delete_count > 0:
             print(f"  T  Move {delete_count} marked email(s) to Trash")
         print("  A  Add a sender to contact list (A.# to specify a given message number)")
-        print("  L  Correct a label (L.# to specify a given message number)")
         print("  M  View message details (M.# to specify a given message number)")
         print("  x  Exit")
         try:
@@ -977,98 +1009,6 @@ def triage_and_label_emails():
             save_contact(name, addr, notes)
             print()
 
-        # Handle 'l' for Correct label
-        elif choice.startswith("l."):
-            try:
-                index_str = choice.split('.', 1)[1]
-                sel_idx = int(index_str) - 1
-                if not (0 <= sel_idx < len(grouped_entries)):
-                    raise ValueError("Index out of bounds")
-                
-                e = grouped_entries[sel_idx]
-                old_decision = e["decision"]
-                new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
-                old_label_id = e.get("custom_label_id") or label_ids[old_decision]
-                new_label_id = label_ids[new_decision]
-
-                call_with_timeout(
-                    service.users().messages().modify(
-                        userId="me", id=e["id"],
-                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
-                    ).execute
-                )
-                if new_decision == "DELETE":
-                    delete_ids.append(e["id"])
-                    delete_count += 1
-                elif e["id"] in delete_ids:
-                    delete_ids.remove(e["id"])
-                    delete_count -= 1
-
-                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
-                print(f"  📝 Label updated.\n")
-                e["decision"] = new_decision
-                e["custom_label_id"] = None
-                e["custom_label_name"] = None
-
-            except (IndexError, ValueError):
-                print("  Invalid selection format. Use 'L' to select from list or 'L.N' (e.g., L.3) for direct selection.\n")
-                continue
-
-        elif choice == "l": # If it was just 'l', proceed with interactive selection
-            if not grouped_entries:
-                print("  No labelled emails in this batch.\n")
-                continue
-            print("\n  Which email's label would you like to correct?")
-            for i, e in enumerate(grouped_entries, start=1):
-                _, addr = parse_sender(e["sender"])
-                icon = "🗑️ " if e["decision"] == "DELETE" else ("👁️ " if e["decision"] == "ATTENTION" else "⚙️ ")
-                print(f"  [{i}/{len(grouped_entries)}] {icon} {LABEL_NAMES[e['decision']]}")
-                print(f"        From   : {addr}")
-                print(f"        Subject: {e['subject']}")
-            print("  (Enter number, or blank to cancel)")
-            try:
-                sel = input("\n  > ").strip()
-            except (EOFError, KeyboardInterrupt):
-                sel = ""
-            if not sel:
-                print("  Cancelled.\n")
-                continue
-            try:
-                sel_idx = int(sel) - 1
-                if not (0 <= sel_idx < len(grouped_entries)):
-                    raise ValueError
-            except ValueError:
-                print("  Invalid selection.\n")
-                continue
-
-            e = grouped_entries[sel_idx]
-            old_decision = e["decision"]
-            new_decision = "ATTENTION" if old_decision == "DELETE" else "DELETE"
-            old_label_id = e.get("custom_label_id") or label_ids[old_decision]
-            new_label_id = label_ids[new_decision]
-
-            try:
-                call_with_timeout(
-                    service.users().messages().modify(
-                        userId="me", id=e["id"],
-                        body={"addLabelIds": [new_label_id], "removeLabelIds": [old_label_id]}
-                    ).execute
-                )
-                if new_decision == "DELETE":
-                    delete_ids.append(e["id"])
-                    delete_count += 1
-                elif e["id"] in delete_ids:
-                    delete_ids.remove(e["id"])
-                    delete_count -= 1
-
-                print(f"\n  ✅ Flipped: {LABEL_NAMES[old_decision]} → {LABEL_NAMES[new_decision]}")
-                print(f"  📝 Label updated.\n")
-                e["decision"] = new_decision
-                e["custom_label_id"] = None
-                e["custom_label_name"] = None
-            except Exception as ex:
-                print(f"  ⚠️  Failed to update label: {ex}\n")
-
         # Handle 'm' for View message details
         elif choice.startswith("m."):
             try:
@@ -1121,7 +1061,7 @@ def triage_and_label_emails():
             break
 
         else:
-            print("  Unrecognised option. Please choose R, T, A, L, M, or x.\n")
+            print("  Unrecognised option. Please choose R, T, A, M, or x.\n")
 
 
 if __name__ == "__main__":

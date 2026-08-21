@@ -113,38 +113,6 @@ iterations should:
 The long-term vision is an agent that starts generic and converges toward your
 specific habits and preferences — without ever sending your data to the cloud.
 
-#### Label corrections as a learning signal
-
-The post-batch menu includes a **Correct a label** option (option 4) that lets you
-flip any email in the current batch from `1-NeedAttention` → `1-ToDelete` or vice
-versa. Each flip is a ground-truth signal: the LLM got it wrong, and you know why.
-
-Two failure modes are worth tracking separately:
-
-| Flip direction | What it means | Future use |
-|---|---|---|
-| `NeedAttention` → `ToDelete` | LLM was too cautious — gave ATTENTION to something that didn't warrant it | Could tighten the DELETE criteria in the prompt, or lower the relevance threshold for certain sender types |
-| `ToDelete` → `NeedAttention` | LLM was too aggressive — marked something important for deletion | Higher priority to fix; could add sender/domain to a soft-trust list, or add subject patterns to the ATTENTION criteria |
-
-The code currently applies the label flip immediately in Gmail. The next step is to
-persist each correction to `corrections.yml`. The planned format:
-
-```yaml
-corrections:
-  - date: '2026-05-29'
-    from: ToDelete
-    to: NeedAttention
-    sender: billing@acme.com
-    subject: Your invoice is ready
-    reason: ''   # optional note by user
-```
-
-Once enough corrections accumulate, they can be used to:
-- Automatically add frequently-corrected senders to the trusted list
-- Surface recurring patterns to the user ("You've corrected 5 emails from
-  newsletters this week — consider adjusting the promotions hint")
-- Eventually fine-tune the prompt with few-shot examples drawn from real corrections
-
 ---
 
 ## How It Works
@@ -180,7 +148,6 @@ Once enough corrections accumulate, they can be used to:
      R  Run another batch
      T  Move marked emails to Trash (with confirmation)
      A  Add a sender to the trusted contact list (A.# to specify a given message number)
-     L  Correct a label (L.# to specify a given message number)
      x  Exit
 ```
 
@@ -223,6 +190,13 @@ Quick reference:
 
 Both prompt builders return `matched_rule`/`reason` text so every decision in the
 Detailed Results report traces back to which rule or signal drove it.
+
+**Email age is computed in code, not by the LLM.** `mailAgent.py` calculates
+`days_old` from the parsed `Date` header and passes it into `build_stage1_prompt`
+as a plain-language hint ("This email is N days old."). Smaller/cheaper models are
+inconsistent at date arithmetic — subtracting a header timestamp from "today" — so
+rather than trusting the LLM to work that out from raw dates, the app does the
+subtraction itself and hands over the answer.
 
 ---
 
@@ -315,7 +289,6 @@ What would you like to do?
   R  Run another batch
   T  Move 6 marked email(s) to Trash
   A  Add a sender to contact list
-  L  Correct a label
   x  Exit
 
 >

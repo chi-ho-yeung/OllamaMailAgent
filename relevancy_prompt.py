@@ -71,11 +71,13 @@ MATCHED_RULE_REASONS = {
 }
 
 
-def build_stage1_prompt(sender, date, subject, body, category_hint=" "):
+def build_stage1_prompt(sender, date, subject, body, category_hint=" ", days_old=None):
     today_now = datetime.now().strftime("%Y-%m-%d")
+    age_hint = f"This email is {days_old} days old." if days_old is not None else ""
     prompt = f"""You are STAGE ONE of a two-stage email triage pipeline. Your only job is to sort this email into KEEP, DISCARD, or UNSURE. Do not agonize over borderline cases — that is what stage two is for. Be decisive on clear-cut cases, and honest about unclear ones.
 
 {category_hint}
+{age_hint}
 
 First, identify the email's language for "detected_language" — do this regardless of anything else below.
 
