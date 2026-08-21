@@ -5,28 +5,6 @@ Runs in batches, labels emails, and gives you the option to move marked emails t
 
 ---
 
-## What This Does For You
-
-From the user's side, the app's job is threefold:
-
-1. **Decide what can be deleted.** Newsletters, marketing, expired promos, digests,
-   non-English/Spanish spam — sorted out and queued for Trash without you having to
-   look at each one.
-2. **Decide what needs your attention.** Bills, deadlines, notices, genuine personal
-   correspondence — surfaced and left in your inbox so nothing important gets buried.
-3. **Give you the tools to file important messages away.** The `M` → `C` flow lets
-   you move a kept message straight to any existing Gmail label from the triage
-   list itself, so the end state of a batch isn't just "deleted" vs. "still sitting
-   in the inbox" — attention-worthy mail can be filed into the right place without
-   leaving the app.
-
-Right now, *you* pick the destination label in step 3. A natural next step is
-having the app suggest where a message probably belongs — e.g. recognizing a
-recurring biller and proposing its existing "Bills" label — rather than making
-you choose from the full label list every time.
-
----
-
 ## Project Goals
 
 ### Proof of Concept: Small Models, Modest Hardware
@@ -311,7 +289,6 @@ What would you like to do?
   R  Run another batch
   T  Move 6 marked email(s) to Trash
   A  Add a sender to contact list
-  L  Correct a label
   x  Exit
 
 >

@@ -871,7 +871,7 @@ def triage_and_label_emails():
 
     # ── Summary report ────────────────────────────────────────────────────────
     total_processed = sum(metrics[k] for k in LABEL_NAMES)
-    avg_ai_time = sum(ai_times) / len(ai_times) if ai_times else 0
+    avg_blended_time = sum(ai_times) / len(ai_times) if ai_times else 0
     avg_stage1_time = sum(stage1_times) / len(stage1_times) if stage1_times else 0
     avg_stage2_time = sum(stage2_times) / len(stage2_times) if stage2_times else 0
 
@@ -884,7 +884,7 @@ def triage_and_label_emails():
         print(f"  {icons.get(key, '  ')}{name:<20}: {metrics[key]}")
     if metrics["ERROR_FALLBACK"]:
         print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
-    print(f"Avg Inference    : {avg_ai_time:.2f}s  (blended stage 1 / stage 1+2)")
+    print(f"Avg Inference    : {avg_blended_time:.2f}s  (blended stage 1 / stage 1+2)")
     print(f"  Stage 1 avg    : {avg_stage1_time:.2f}s  ({len(stage1_times)} calls)")
     if stage2_times:
         print(f"  Stage 2 avg    : {avg_stage2_time:.2f}s  ({len(stage2_times)} escalated to stage 2)")
