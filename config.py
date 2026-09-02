@@ -58,6 +58,12 @@ MODEL_CONFIGS = {
         "temperature": 0.7,
         "top_p": 0.8,
     },
+    "lfm2.5:8b": { "format": "json",
+        "num_ctx": 4096,
+        "temperature": 0.2,
+        "top_k": 80,
+        "repetition_penalty": 1.05,
+    },
 }
 
 try:
