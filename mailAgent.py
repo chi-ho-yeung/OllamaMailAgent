@@ -26,7 +26,6 @@ from email.header import decode_header
 from config import EMAIL_ACCOUNT, USER_NAME, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS, DEFAULT_MODEL_CONFIG
 from refresh_oauth_token import get_gmail_service
 from relevancy_prompt import (
-    USER_LANGUAGES,
     VALID_DECISIONS,
     VALID_VERDICTS,
     MATCHED_RULE_REASONS,
@@ -433,8 +432,6 @@ def show_message_detail(service, e, label_ids, delete_ids):
         print(f"Current label : {current_label_name}")
         if e.get("relevance_score") not in (None, "?"):
             print(f"Relevance     : {e['relevance_score']}/5")
-        if e.get("lang_note"):
-            print(e["lang_note"])
         if e.get("summary"):
             print(f"Summary       : {e['summary']}")
         if e.get("reason"):
@@ -687,7 +684,6 @@ def triage_and_label_emails():
             "summary": "",
             "reason": "",
             "trusted": bool(sender_contact_label),
-            "lang_note": "",
             "body_preview": "",
             "custom_label_id": None,
             "custom_label_name": None,
@@ -798,7 +794,6 @@ def triage_and_label_emails():
         summary = ""
         reason = ""
         relevance_score = "?"
-        detected_language = ""
         decision = None
 
         ai_start = time.time()
@@ -836,28 +831,12 @@ def triage_and_label_emails():
             verdict = stage1_result.get("verdict", "").upper()
             matched_rule = stage1_result.get("matched_rule", "NONE").upper()
             relevance_score = stage1_result.get("relevance_score", "?")
-            detected_language = stage1_result.get("detected_language", "").strip()
         except Exception:
             reason = f"Could not parse stage 1 response. Raw: {stage1_text[:120]!r}"
             metrics["ERROR_FALLBACK"] += 1
 
-        # Rule 1 (language) is ENFORCED HERE IN CODE, not left to the model's
-        # own final verdict — the model is reliable at identifying what
-        # language something is written in; it's much less reliable at also
-        # correctly applying "therefore DELETE" once other content (a promo,
-        # an appointment) is pulling it another way. So the model only
-        # reports the language, and code makes the DELETE call — and skips
-        # stage 2 entirely, since a foreign-language email doesn't need a
-        # judgment call, it just needs deleting.
-        is_foreign_language = bool(detected_language) and detected_language not in USER_LANGUAGES
-        if is_foreign_language:
-            entry["lang_note"] = f"🌐 Detected language: {detected_language}"
-
         if verdict is None:
             decision = "ERROR"
-        elif is_foreign_language:
-            decision = "DELETE"
-            reason = f"Non-target-language email ('{detected_language}') — deleted regardless of stage 1 verdict."
         elif verdict == "KEEP":
             decision = "ATTENTION"
             reason = MATCHED_RULE_REASONS.get(matched_rule, "Stage 1 matched a keep-worthy rule.")
@@ -984,8 +963,6 @@ def triage_and_label_emails():
             print(f"  📝 {e['subject']}")
             elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
             print(f"  {icon}{label_display} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
-            if e.get("lang_note"):
-                print(f"  {e['lang_note']}")
             if e.get("summary"):
                 print(f"  💬 {e['summary']}")
             if e.get("reason"):

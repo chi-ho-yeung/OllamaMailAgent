@@ -57,9 +57,9 @@ Triage runs as **two separate LLM calls**, not one — a change made specificall
 get better results out of small models.
 
 The original single-prompt design asked the model to do several things in one pass:
-identify the language, check five different objective rules (bill? deadline? notice?
-promo? real person?), weigh soft signals like sender identity and tone, *and* commit
-to a final verdict — all in one shot. In testing, this was where small models broke
+check five different objective rules (bill? deadline? notice? promo? real person?),
+weigh soft signals like sender identity and tone, *and* commit to a final
+verdict — all in one shot. In testing, this was where small models broke
 down. A 3B model correctly reasoned that an email failed every rule, then talked
 itself out of its own conclusion anyway because a promotional detail in the body kept
 pulling it toward the wrong answer. The failure wasn't the model's language skill or
@@ -81,22 +81,17 @@ The fix: split detection from judgment, into two narrower calls.
   sales pitch. Only here does the model get asked to weigh several fuzzy signals
   against each other — and only on emails where that's actually necessary.
 
-Two things fall out of this that are also enforced deterministically in code rather
-than left to the model: language detection isn't trusted to also drive the final
-decision (stage 1 only *reports* the detected language; `mailagent.py` enforces the
-DELETE rule itself, so a model can't reason its way past a fact it already stated),
-and a personal-*sounding* sender is deliberately excluded from stage 1's KEEP list —
-sender identity can be spoofed via `Reply-To`, so it's held back for stage 2's closer,
-cross-referenced look rather than getting a fast, unverified pass.
+In addition, a personal-*sounding* sender is deliberately excluded from stage 1's
+KEEP list — sender identity can be spoofed via `Reply-To`, so it's held back for
+stage 2's closer, cross-referenced look rather than getting a fast, unverified pass.
 
 The underlying idea generalizes: **narrow, single-purpose classification is where
 small models are reliable; multi-factor arbitration in a single pass is where they
 aren't.** Two stages was the minimum split needed to fix the failure mode observed —
 if a smaller model (this project was tested down to a 1.2B) starts showing the same
 kind of "correct rule, wrong final answer" behavior even within a single stage, the
-plan is to split further — e.g. separating language detection from rule-matching, or
-giving stage 2's judgment signals (recency, sender identity, tone) their own passes
-— rather than trying to fix it by writing a more emphatic prompt.
+plan is to split further — e.g. giving stage 2's judgment signals (recency, sender identity,
+tone) their own passes — rather than trying to fix it by writing a more emphatic prompt.
 
 ---
 
@@ -126,10 +121,7 @@ specific habits and preferences — without ever sending your data to the cloud.
      - Check if sender is in contacts.yml trusted list → label ATTENTION instantly, skip both LLM stages
      - Otherwise extract subject, sender, Reply-To, date, body, and Gmail category hint
      - STAGE 1 (always runs): ask the LLM to sort the email into KEEP / DISCARD /
-       UNSURE against objective rules (money, deadline, notice, valid promo), and
-       report the email's detected language
-       · detected_language not English/Spanish → DELETE, enforced in code,
-         regardless of the model's verdict — STAGE 2 is skipped
+       UNSURE against objective rules (money, deadline, notice, valid promo)
        · KEEP    → ATTENTION, reason generated from the matched rule
        · DISCARD → DELETE, reason generated in code
        · UNSURE  → falls through to STAGE 2
@@ -167,7 +159,7 @@ Defined in `LABEL_NAMES` at the top of `mailagent.py`:
 
 | Key         | Gmail Label       | Icon | Inbox | Meaning |
 |-------------|-------------------|------|-------|----------|
-| `DELETE`    | `1-ToDelete`      | 🗑️   | Archived | Newsletters, marketing, shipping alerts, social media, expired promotions, non-English/Spanish spam — see the stage table below for the exact rules |
+| `DELETE`    | `1-ToDelete`      | 🗑️   | Archived | Newsletters, marketing, shipping alerts, social media, expired promotions — see the stage table below for the exact rules |
 | `ATTENTION` | `1-NeedAttention` | 👁️   | Kept  | Bills, deadlines, notices, valid promos, genuine personal correspondence — see the stage table below for the exact rules |
 | `ERROR`     | `1-ProcessError`  | ⚙️   | Kept  | Either stage's LLM call failed, or the response couldn't be parsed / returned an invalid value — review manually |
 
@@ -185,7 +177,6 @@ Quick reference:
 | Stage | Checks | Outcome |
 |-------|--------|---------|
 | 1 — `build_stage1_prompt` | MONEY (bill/payment or account activity with a dollar amount), DEADLINE (unexpired appointment or reply needed), NOTICE (security/account/receipt/tax/legal), PROMO (unexpired offer) | `KEEP` → ATTENTION, `DISCARD` (generic marketing/newsletter/digest/expired promo/automated status) → DELETE, `UNSURE` → escalates to stage 2 |
-| 1 — language (code-enforced) | `detected_language` reported by stage 1, checked against `USER_LANGUAGES` in code | Non-English/Spanish → DELETE immediately, stage 2 skipped |
 | 2 — `build_stage2_prompt` | Gmail category lean, recency, addressed by name (`USER_NAME`), PERSON (real name in `From` vs. a `Reply-To` that points to a business/support/no-reply alias), sales-pitch tone | Judgment call → ATTENTION or DELETE |
 
 Both prompt builders return `matched_rule`/`reason` text so every decision in the

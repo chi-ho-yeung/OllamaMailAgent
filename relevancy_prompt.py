@@ -24,14 +24,6 @@ Splitting the work this way means each individual call asks a small model
 to do less at once — narrow, low-ambiguity classification is where small
 models tend to be reliable; multi-factor arbitration in a single pass is
 where they aren't.
-
-Stage 1 also reports "detected_language" for every email. Language is NOT
-a rule the LLM is trusted to apply on its own — the model is reliable at
-identifying what language something is written in, less reliable at also
-correctly applying "therefore DELETE" once other content (a promo, an
-appointment) is pulling it toward KEEP. So the model only reports the
-language, and mailAgent.py enforces the DELETE call in code, overriding
-whatever verdict stage 1 reached, before stage 2 is ever considered.
 ================================================================================
 """
 from datetime import datetime
@@ -44,8 +36,6 @@ CATEGORY_MAP = {
     "CATEGORY_FORUMS":     ("Forums",     "Lean DISCARD."),
     "CATEGORY_PERSONAL":   ("Personal",   "Lean KEEP."),
 }
-
-USER_LANGUAGES = ["English", "Spanish"]
 
 VALID_DECISIONS = ["DELETE", "ATTENTION"]        # stage 2's final call
 VALID_VERDICTS = ["KEEP", "DISCARD", "UNSURE"]   # stage 1's triage call
@@ -79,9 +69,7 @@ def build_stage1_prompt(sender, date, subject, body, category_hint=" ", days_old
 {category_hint}
 {age_hint}
 
-First, identify the email's language for "detected_language" — do this regardless of anything else below.
-
-Then apply these checks:
+Apply these checks:
 
 KEEP if the email clearly matches ANY of:
   MONEY — a specific dollar amount tied to a bill (balance, minimum payment, amount due, due date) or to money that already moved (transfer, deposit, withdrawal, payment sent/received).
@@ -104,7 +92,6 @@ Body: {body.strip()}
 
 IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
 {{
-  "detected_language": "language the email is written in, e.g. Chinese, English, Spanish",
   "verdict": "KEEP" or "DISCARD" or "UNSURE",
   "matched_rule": "MONEY" or "DEADLINE" or "NOTICE" or "PROMO" or "JUNK" or "NONE",
   "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing, 1 = no personal relevance"
