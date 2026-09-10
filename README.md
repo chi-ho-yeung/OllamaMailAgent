@@ -139,7 +139,8 @@ specific habits and preferences — without ever sending your data to the cloud.
 8. Post-batch menu:
      R  Run another batch
      T  Move marked emails to Trash (with confirmation)
-     A  Add a sender to the trusted contact list (A.# to specify a given message number)
+     A  Add a sender to contact rules (A.# to specify a given message number)
+     M  View message details (M.# to specify a given message number)
      x  Exit
 ```
 
@@ -147,9 +148,19 @@ See [Two-Stage Triage: Right-Sizing the Task for the Model](#two-stage-triage-ri
 above for why triage is split into two LLM calls instead of one, and what
 determines whether an email needs both.
 
-Emails labelled `1-ToDelete` are **not moved automatically**. Option 2 asks for
+Emails labelled `1-ToDelete` are **not moved automatically**. Option T asks for
 confirmation before trashing — you stay in control every run. Only DELETE emails
 are archived out of the inbox; ATTENTION and ERROR emails remain visible.
+
+### Manual Review & Correction
+
+The agent provides a deep-dive view for any message in the current batch (Option M).
+From the message detail screen, you can:
+- **Correct the triage label (L)**: Instantly flip a message between `1-ToDelete`
+  and `1-NeedAttention`.
+- **Assign a custom label (C)**: Move the email to any of your existing Gmail labels
+  or create a new one on the fly. This removes the triage label and archives the
+  email from the inbox.
 
 ---
 
@@ -272,14 +283,17 @@ Emails Processed : 10
   🗑️ 1-ToDelete          : 6
   👁️ 1-NeedAttention     : 3
   ⚙️ 1-ProcessError      : 1
-Avg Inference    : 22.1s
-Total Time       : 132.6s
+Avg Inference    : 22.10s  (blended stage 1 / stage 1+2)
+  Stage 1 avg    : 12.40s (10 calls)
+  Stage 2 avg    : 35.20s (3 escalated to stage 2)
+Total Time       : 132.60s
 ========================================
 
 What would you like to do?
   R  Run another batch
   T  Move 6 marked email(s) to Trash
-  A  Add a sender to contact list
+  A  Add a sender to contact list (A.# for specific email)
+  M  View message details (M.# for specific email)
   x  Exit
 
 >
@@ -304,9 +318,9 @@ on modest hardware. To switch models, update `OLLAMA_MODEL` in your `.env`.
 
 | Model                  | Avg. inference time | Thinking mode | Notes                             |
 |------------------------|--------------------:|:-------------:|-----------------------------------|
-| `qwen2.5:3b-instruct` ✅ | ~10s               | None          | **Recommended default.** No thinking mode, very fast |
+| `qwen2.5:3b-instruct`  | ~10s               | None          | **Recommended for mid-range hardware** |
+| `qwen3.5:4b`           | ~60–70s             | Suppressed    | **Higher accuracy**, slower speed |
 | `qwen3.5:2b`           | ~23s                | Suppressed    | Fast and accurate                  |
-| `qwen3.5:4b`           | ~60–70s             | Suppressed    | More powerful hardware recommended |
 | `phi4-mini`            | ~15s                | None          | Microsoft model, compact and capable |
 | `granite4.1:3b`        | ~12s                | None          | IBM Granite, strong instruction following |
 | `ministral-3:3b`       | ~10s                | None          | Mistral's 3B, fast and efficient   |
@@ -369,13 +383,11 @@ mailagent/
 ├── requirements.txt          # Python dependencies
 ├── README.md                 # This file
 ├── OAUTH_SETUP.md            # Gmail OAuth setup guide
-├── secrets/                  # Gitignored — all credentials here
-│   ├── .env                  # EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST
-│   ├── credentials.json     # Google OAuth client ID/secret
-│   ├── token.json           # Auto-generated OAuth token
-│   └── contacts.yml          # Trusted senders (auto-created)
-└── config/                   # Gitignored — user config
-    └── labels.json          # Optional label mappings
+└── secrets/                  # Gitignored — all credentials here
+    ├── .env                  # EMAIL_ACCOUNT, OLLAMA_MODEL, OLLAMA_HOST
+    ├── credentials.json     # Google OAuth client ID/secret
+    ├── token.json           # Auto-generated OAuth token
+    └── contacts.yml          # Contact rules (auto-created)
 ```
 
 ---
