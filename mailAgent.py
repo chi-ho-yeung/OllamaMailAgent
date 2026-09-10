@@ -27,7 +27,7 @@ from config import EMAIL_ACCOUNT, USER_NAME, OLLAMA_MODEL, OLLAMA_HOST, ollama_c
 from refresh_oauth_token import get_gmail_service
 from relevancy_prompt import (
     VALID_DECISIONS,
-    VALID_VERDICTS,
+    VALID_RULES,
     MATCHED_RULE_REASONS,
     get_category_hint,
     build_stage1_prompt,
@@ -430,8 +430,6 @@ def show_message_detail(service, e, label_ids, delete_ids):
         if e.get("category"):
             print(f"Gmail category: {e['category']}")
         print(f"Current label : {current_label_name}")
-        if e.get("relevance_score") not in (None, "?"):
-            print(f"Relevance     : {e['relevance_score']}/5")
         if e.get("summary"):
             print(f"Summary       : {e['summary']}")
         if e.get("reason"):
@@ -679,7 +677,6 @@ def triage_and_label_emails():
             "date": date,
             "category": gmail_category or "",
             "decision": None,
-            "relevance_score": "?",
             "elapsed": None,
             "summary": "",
             "reason": "",
@@ -793,7 +790,6 @@ def triage_and_label_emails():
 
         summary = ""
         reason = ""
-        relevance_score = "?"
         decision = None
 
         ai_start = time.time()
@@ -825,25 +821,21 @@ def triage_and_label_emails():
         stage1_times.append(stage1_elapsed)
 
         verdict = None
-        matched_rule = "NONE"
+        matched_rule = "UNSURE"
         try:
             stage1_result = _parse_json_response(stage1_text)
-            verdict = stage1_result.get("verdict", "").upper()
-            matched_rule = stage1_result.get("matched_rule", "NONE").upper()
-            relevance_score = stage1_result.get("relevance_score", "?")
+            matched_rule = stage1_result.get("matched_rule", "UNSURE").upper()
         except Exception:
             reason = f"Could not parse stage 1 response. Raw: {stage1_text[:120]!r}"
             metrics["ERROR_FALLBACK"] += 1
 
-        if verdict is None:
-            decision = "ERROR"
-        elif verdict == "KEEP":
+        if matched_rule in ["MONEY", "DEADLINE", "NOTICE", "PROMO"]:
             decision = "ATTENTION"
             reason = MATCHED_RULE_REASONS.get(matched_rule, "Stage 1 matched a keep-worthy rule.")
-        elif verdict == "DISCARD":
+        elif matched_rule == "JUNK":
             decision = "DELETE"
             reason = MATCHED_RULE_REASONS.get("JUNK", "Stage 1 matched generic/junk criteria.")
-        elif verdict == "UNSURE":
+        elif matched_rule == "UNSURE":
             # ── Stage 2: only for genuinely ambiguous survivors ─────────────
             stage2_prompt = build_stage2_prompt(
                 sender=sender,
@@ -862,7 +854,6 @@ def triage_and_label_emails():
                 decision = stage2_result.get("decision", "").upper()
                 summary = stage2_result.get("summary", "")
                 reason = stage2_result.get("reason", "No reason provided.")
-                relevance_score = stage2_result.get("relevance_score", relevance_score)
                 if decision not in VALID_DECISIONS:
                     reason = f"Stage 2 returned unrecognised decision {decision!r}. {reason}"
                     decision = "ERROR"
@@ -876,7 +867,7 @@ def triage_and_label_emails():
                 metrics["ERROR_FALLBACK"] += 1
         else:
             decision = "ERROR"
-            reason = f"Stage 1 returned unrecognised verdict: {verdict!r}"
+            reason = f"Stage 1 returned unrecognised rule: {matched_rule!r}"
             metrics["ERROR_FALLBACK"] += 1
 
         elapsed = time.time() - ai_start
@@ -885,7 +876,6 @@ def triage_and_label_emails():
         metrics[decision] = metrics.get(decision, 0) + 1
 
         entry["elapsed"] = elapsed
-        entry["relevance_score"] = relevance_score
         entry["summary"] = summary
         entry["reason"] = reason
 
@@ -916,12 +906,6 @@ def triage_and_label_emails():
     # this displayed order, not the order emails were originally processed.
     GROUP_ICONS = {"ATTENTION": "👁️ ", "ERROR": "⚙️ ", "DELETE": "🗑️ "}
 
-    def _relevance_sort_key(e):
-        try:
-            return -int(e.get("relevance_score", "?"))
-        except (ValueError, TypeError):
-            return 1  # unscored entries sort last within their group
-
     def _get_group_order(entries):
         custom_groups = sorted(list(set(
             e["decision"] for e in entries
@@ -941,7 +925,6 @@ def triage_and_label_emails():
         group_order = _get_group_order(batch_senders)
         for key in group_order:
             group_items = [e for e in batch_senders if e.get("decision") == key]
-            group_items.sort(key=_relevance_sort_key)
             grouped_entries.extend(group_items)
 
         if not grouped_entries:
@@ -962,7 +945,7 @@ def triage_and_label_emails():
             print(f"[{i}/{len(grouped_entries)}] {e['date']} {cat_str}{e['sender'].replace('\\n', ' ').replace('\\t', ' ').strip()[:60]}")
             print(f"  📝 {e['subject']}")
             elapsed_str = f"{e['elapsed']:.1f}s" if e.get("elapsed") is not None else "skip"
-            print(f"  {icon}{label_display} | ⏱ {elapsed_str} | 📊 Rel: {e.get('relevance_score', '?')}/5")
+            print(f"  {icon}{label_display} | ⏱ {elapsed_str}")
             if e.get("summary"):
                 print(f"  💬 {e['summary']}")
             if e.get("reason"):

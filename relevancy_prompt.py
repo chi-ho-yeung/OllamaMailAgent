@@ -38,7 +38,8 @@ CATEGORY_MAP = {
 }
 
 VALID_DECISIONS = ["DELETE", "ATTENTION"]        # stage 2's final call
-VALID_VERDICTS = ["KEEP", "DISCARD", "UNSURE"]   # stage 1's triage call
+# Stage 1 now returns only the matched category/rule.
+VALID_RULES = ["MONEY", "DEADLINE", "NOTICE", "PROMO", "JUNK", "UNSURE"]
 
 
 def get_category_hint(gmail_labels):
@@ -64,23 +65,22 @@ MATCHED_RULE_REASONS = {
 def build_stage1_prompt(sender, date, subject, body, category_hint=" ", days_old=None):
     today_now = datetime.now().strftime("%Y-%m-%d")
     age_hint = f"This email is {days_old} days old." if days_old is not None else ""
-    prompt = f"""You are STAGE ONE of a two-stage email triage pipeline. Your only job is to sort this email into KEEP, DISCARD, or UNSURE. Do not agonize over borderline cases — that is what stage two is for. Be decisive on clear-cut cases, and honest about unclear ones.
+    prompt = f"""You are STAGE ONE of a two-stage email triage pipeline. Your only job is to categorize this email into one of the following rules. Do not agonize over borderline cases — that is what stage two is for. Be decisive on clear-cut cases, and honest about unclear ones.
 
 {category_hint}
 {age_hint}
 
 Apply these checks:
 
-KEEP if the email clearly matches ANY of:
+Categorize as one of these "KEEP" rules if the email clearly matches:
   MONEY — a specific dollar amount tied to a bill (balance, minimum payment, amount due, due date) or to money that already moved (transfer, deposit, withdrawal, payment sent/received).
   DEADLINE — requires a reply, or has an appointment/deadline that has NOT yet passed (compare Message Date and any stated deadline to Current Date).
   NOTICE — a security alert, account change, receipt, or medical/tax/legal notice.
   PROMO — a promotion or deal with an expiration date that has NOT yet passed.
-  Set "matched_rule" to whichever one applied.
 
-DISCARD if the email is clearly generic marketing, a newsletter, a social/forum digest, an expired promotion, or a routine automated status update, with NONE of the signals above. Set "matched_rule" to "JUNK".
+Categorize as JUNK if the email is clearly generic marketing, a newsletter, a social/forum digest, an expired promotion, or a routine automated status update, with NONE of the signals above.
 
-UNSURE if it doesn't cleanly fit KEEP or DISCARD — e.g. a borderline promotional email, an old but maybe-still-relevant update, an email that merely SOUNDS like it's from a real person but doesn't clearly match another KEEP rule (sender identity can be spoofed, so it needs a closer look), or anything else needing more judgment about the sender or the tone of the message. Set "matched_rule" to "NONE". When genuinely in doubt, choose UNSURE rather than guessing — a second, more careful pass will look at it.
+Categorize as UNSURE if it doesn't cleanly fit any of the above — e.g. a borderline promotional email, an old but maybe-still-relevant update, an email that merely SOUNDS like it's from a real person but doesn't clearly match another rule (sender identity can be spoofed, so it needs a closer look), or anything else needing more judgment about the sender or the tone of the message. When genuinely in doubt, choose UNSURE rather than guessing — a second, more careful pass will look at it.
 
 [EMAIL CONTENT START]
 From: {sender}
@@ -92,9 +92,7 @@ Body: {body.strip()}
 
 IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text, markdown blocks, or commentary.
 {{
-  "verdict": "KEEP" or "DISCARD" or "UNSURE",
-  "matched_rule": "MONEY" or "DEADLINE" or "NOTICE" or "PROMO" or "JUNK" or "NONE",
-  "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing, 1 = no personal relevance"
+  "matched_rule": "MONEY" or "DEADLINE" or "NOTICE" or "PROMO" or "JUNK" or "UNSURE"
 }}"""
     return prompt
 
@@ -143,7 +141,6 @@ IMPORTANT: Respond ONLY with a valid JSON object. Do not include any other text,
 {{
   "reason": "which signals mattered most and why, written in English",
   "decision": "{VALID_DECISIONS[0]}" or "{VALID_DECISIONS[1]}",
-  "summary": "1 sentence summary, written in English",
-  "relevance_score": "1-5, where 5 = requires action or is critical financial/legal/medical/personal information, 3 = informational but genuinely worth knowing, 1 = no personal relevance"
+  "summary": "1 sentence summary, written in English"
 }}"""
     return prompt
