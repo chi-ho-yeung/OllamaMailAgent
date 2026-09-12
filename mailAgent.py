@@ -158,9 +158,17 @@ _INVISIBLE_CHARS_RE = re.compile(
     "[\u034f\u00ad\u200b\u200c\u200d\u2060\ufeff\u180e]"
 )
 # After stripping invisible chars, what's left of those padding blocks is
-# runs of plain spaces (and blank lines) — collapse those down too.
+# runs of plain spaces — collapse those down too.
 _MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
-_MULTI_BLANK_LINE_RE = re.compile(r"\n\s*\n\s*\n+")
+# Lines that are pure leftover HTML-source artifacts (a bracket, a trailing
+# '](url)' with only a URL after it, a bare URL, etc.) that leak through when
+# raw HTML is dumped as visible text.
+_HTML_SOURCE_NOISE_RE = re.compile(
+    r"^\s*(?:\[[^\]]*\]\s*)?\(https?:\/\/[^\s)]*\)\s*$"   # (url) or [t](url)
+    r"|^\s*\]\s*\(https?:\/\/[^\)\s]*\)\s*$"             # ](url)
+    r"|^\s*\[[^\]]*\]\s*$"                                 # [bracket]
+    r"|^\s*https?:\/\/\S+\s*$"                             # bare URL
+)
 
 
 def clean_text(text_body):
@@ -177,11 +185,25 @@ def clean_text(text_body):
     text = soup.get_text(separator="\n")
     text = _INVISIBLE_CHARS_RE.sub("", text)
     text = _MULTI_SPACE_RE.sub(" ", text)
-    # Collapse each line's leading/trailing space left over after stripping
-    # invisible chars, then collapse 3+ blank lines down to a single blank line.
-    text = "\n".join(line.strip() for line in text.split("\n"))
-    text = _MULTI_BLANK_LINE_RE.sub("\n\n", text)
-    return text.strip()
+
+    # Marketing emails dump raw HTML source as visible text (e.g. button blocks
+    # rendered twice, or a template column duplicated), producing repeated lines
+    # and HTML artifacts. Clean line by line: strip whitespace, remove empty
+    # lines and HTML noise, and collapse consecutive duplicate lines.
+    cleaned_lines = []
+    prev_line = None
+    for raw_line in text.split("\n"):
+        line = raw_line.strip()
+        if not line:
+            continue
+        if _HTML_SOURCE_NOISE_RE.match(line):
+            continue
+        if line == prev_line:
+            continue
+        cleaned_lines.append(line)
+        prev_line = line
+
+    return "\n".join(cleaned_lines)
 
 
 def load_contacts():
