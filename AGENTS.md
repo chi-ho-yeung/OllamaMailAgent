@@ -4,70 +4,57 @@ Orientation for LLM agents working in this repo. Read before making changes.
 
 ## What this project does
 
-CLI tool that triages a Gmail inbox using a **local** LLM via Ollama in batches. It analyzes emails, applies Gmail triage labels, archives non-relevant messages, and presents reports and interactive actions to review or process emails.
+CLI tool that triages a Gmail inbox using a **local decision model** served by llama.cpp (`POST /v1/systemone`). One request per email: the model answers typed questions with probabilities, Python decides, the tool applies Gmail labels (archiving likely-deletes) and offers an interactive review menu.
+
+**Decision models only.** Chat/text models are not supported: the server returns 501 on `/v1/systemone` for them and the app refuses to start. Do not reintroduce `/v1/chat/completions`, prompt-the-model-for-a-word flows, or JSON-parsing of model prose.
 
 ## File map
 
-| File | Layer / Purpose |
+| File | Purpose |
 |---|---|
-| `mailAgent.py` | Main orchestrator & CLI runtime: fetches untagged messages, sanitizes email content, coordinates the two-stage LLM triage pipeline, applies Gmail label modifications, and drives the user interaction loop. Note capital A. |
-| `relevancy_prompt.py` | Prompt engineering & classification schemas: Stage 1 objective triage prompt (`build_stage1_prompt`), Stage 2 subjective judgment prompt (`build_stage2_prompt`), category hint mapping, and valid verdict definitions. |
-| `config.py` | Environment & model configuration: loads `.env`, manages Ollama host/model settings, and defines per-model Ollama parameters (`MODEL_CONFIGS`/`DEFAULT_MODEL_CONFIG`). Import has side effects: verifies Ollama connectivity and prints status. |
-| `refresh_oauth_token.py` | Authentication layer: `get_gmail_service()` handles Gmail OAuth2 token retrieval, local browser consent, and auto-refresh. |
-| `requirements.txt` | Python dependencies (`beautifulsoup4`, `google-api-python-client`, `google-auth*`, `ollama`, `python-dotenv`, `pyyaml`). |
-| `README.md` | Full documentation: architecture rationale, two-stage triage design, setup instructions, and model benchmarks. |
-| `OAUTH_SETUP.md` | Google Cloud Console OAuth setup walkthrough. |
-| `secrets/` | Gitignored directory: `.env`, `credentials.json`, `token.json`, `contacts.yml`. Never read, print, or commit. |
+| `mailAgent.py` | Orchestrator & CLI: fetches untagged messages, sanitizes content, calls the decision model once per email, applies labels, runs the review menu. Note capital A. |
+| `system_one.py` | `/v1/systemone` client: `decide(state, questions)` → `answers` dict; `check_server()` probe; `DecisionError`. |
+| `relevancy_prompt.py` | The `QUESTIONS` (record / bulk / actionable / personal), `email_signals()` (code-side facts: unsubscribe header, no-reply sender, Reply-To mismatch), `build_state()`, and `decide_action()` which maps probabilities to ATTENTION/DELETE. |
+| `config.py` | Env config + tuning thresholds. No import-time side effects. |
+| `refresh_oauth_token.py` | `get_gmail_service()` — Gmail OAuth2. |
+| `secrets/` | Gitignored: `.env`, `credentials.json`, `token.json`, `contacts.yml`. Never read, print, or commit. |
 
 ## Call graph
 
 ```
-mailAgent.py: triage_and_label_emails()   [main entry, run via __main__]
-  ├─ refresh_oauth_token.get_gmail_service()      → Gmail API client
-  ├─ config.ollama_client.list()                   → verify Ollama is up
-  ├─ get_or_create_label()                         → ensure triage labels exist
-  ├─ fetch_untagged_emails()                       → fetch batch of untagged inbox messages
-  └─ for each message:
-       ├─ contacts check (secrets/contacts.yml)    → route known contacts without LLM
-       ├─ clean_text() (BeautifulSoup)             → strip HTML to plain text / sanitize
-       ├─ relevancy_prompt.get_category_hint()     → Gmail category → hint string
-       ├─ relevancy_prompt.build_stage1_prompt()   → Stage 1: objective rule check (NOTICE, PROMO, MONEY, etc.)
-       ├─ config.ollama_client.chat(...)           → local LLM call
-       ├─ [if UNSURE] build_stage2_prompt()        → Stage 2: subjective judgment (ATTENTION/DELETE)
-       ├─ parse JSON response                      → decision/summary/reason/score
-       └─ service.users().messages().modify(...)   → apply Gmail label (archive if DELETE)
+mailAgent.triage_and_label_emails()
+  ├─ get_gmail_service()
+  ├─ system_one.check_server()            → probe: server up AND a decision model
+  ├─ get_or_create_label(), fetch_untagged_emails()
+  └─ per message:
+       ├─ contacts.yml match → label directly, no model call
+       ├─ clean_text() → body[:MAX_BODY_CHARS]
+       ├─ relevancy_prompt.build_state()  → one plain-text state (age computed in code)
+       ├─ system_one.decide(state, QUESTIONS)   → answers (probabilities)
+       ├─ relevancy_prompt.decide_action(answers) → (decision, reason, details)
+       └─ messages.modify(): apply label (archive if DELETE)
 ```
 
-## Key conventions & architecture rules
+## Conventions
 
-- **Labels are the source of truth**: Messages with any triage label defined in `LABEL_NAMES` are treated as processed and skipped in future batches.
-- **`LABEL_NAMES` in `mailAgent.py` is canonical**: Central dictionary defines triage label names across the application. Never hardcode label strings elsewhere.
-- **Two-stage triage pipeline**:
-  - **Stage 1** (`build_stage1_prompt`): Fast, objective classifier matching messages against explicit rules (e.g. `NOTICE`, `PROMO`, `MONEY`, `DEADLINE`) or marking them `UNSURE`.
-  - **Stage 2** (`build_stage2_prompt`): Only invoked for ambiguous survivors (`UNSURE`) to weigh qualitative signals (sender identity vs `Reply-To`, personal address, sales tone).
-- **LLM classification vs. Code decision-making**:
-  - The LLM's role is strictly to classify messages, evaluate relevance, and extract signals (e.g. matched rules like `NOTICE`, `PROMO`, `MONEY` in Stage 1, or subjective signal assessment in Stage 2).
-  - The Python orchestrator makes the final decision on what action to take (e.g. mapping classifications to `ATTENTION` or `DELETE`, applying labels, and archiving).
-  - `ERROR` is Python-only, applied when the model is unreachable or returns invalid/unparseable JSON. Never prompt the LLM to emit `ERROR`.
-- **Model configuration**:
-  - Per-model options live in `config.MODEL_CONFIGS`, falling back to `DEFAULT_MODEL_CONFIG`.
-  - Top-level parameters for Ollama (such as `format` and `think`) are extracted and passed as top-level kwargs to `ollama_client.chat()`.
-- **Safety & archiving**:
-  - Marking `DELETE` archives the email immediately (removes from `INBOX`). Trashing emails is a separate, user-confirmed action.
-- **Cancellation**:
-  - Ctrl+C handling uses a `threading.Event` (`_stop`) checked between processing steps rather than raw unhandled `KeyboardInterrupt` crashes.
+- **Model supplies probabilities; code decides.** Thresholds live in `config.py` (`HARD_KEEP_MIN`, `SOFT_KEEP_MIN`, `DELETE_MIN_PROB`, `DELETE_MIN_PROB_BULK_HEADER`). Hard keep-signals: record/personal; soft: actionable. DELETE = `bulk` above its (header-adjusted) threshold and no keep-signal; the user reviews every DELETE, so leaning toward delete is intended. Never add a compound "should I delete this?" question; keep questions single-concept and combine in `decide_action()`.
+- **Do checkable things in code**, not in prompts (age, headers, domain comparison), and pass them as facts via `email_signals()`.
+- **Decision models write no prose.** `summary` is always empty; `reason` is generated in code from the answers.
+- **`ERROR` is Python-only**: server unreachable, 501, or malformed answer. Labelled `1-ProcessError`, stays in INBOX.
+- **Labels are the source of truth**: messages carrying any label in `LABEL_NAMES` are skipped. `LABEL_NAMES` in `mailAgent.py` is canonical; never hardcode label strings elsewhere.
+- **Safety**: DELETE only archives. Trashing is a separate, user-confirmed action. ATTENTION (including contact rules) stays in INBOX.
+- **Cancellation**: Ctrl+C sets a `threading.Event` (`_stop`) checked between steps.
+- **Adding a signal**: add a question to `QUESTIONS`, read it in `decide_action()`. Questions are batched in one request and the state is processed once, but each extra question adds noticeable time on this hardware (7 questions ~30 s/email vs 3 ~6 s), so only add one if it changes decisions.
 
 ## Running locally
 
-- Requires Ollama running locally with a model pulled and completed OAuth setup (`secrets/.env`, `secrets/credentials.json`; `secrets/token.json` auto-generated).
-- Install dependencies: `pip install -r requirements.txt` (or within a venv).
-- Run: `python mailAgent.py`. First run opens a browser for OAuth consent.
-- `python refresh_oauth_token.py` re-runs auth standalone if token is stale/deleted.
-- `python config.py` prints a standalone config/auth summary without touching Gmail.
+- Serve a decision model: `llama serve -hf ggml-org/Kev-4B-GGUF` (needs a llama.cpp build with `/v1/systemone`; run `llama update`).
+- `pip install -r requirements.txt`, then `python mailAgent.py` (first run opens a browser for OAuth).
+- `python config.py` prints a config summary without touching Gmail.
 
 ## When making changes
 
-- **Prompt & triage behavior tweaks** → `relevancy_prompt.py`. Keep prompt JSON schemas and `mailAgent.py` response parsing in sync.
-- **Triage label categories** → Update `LABEL_NAMES` in `mailAgent.py`.
-- **Ollama model options** → Add or update `MODEL_CONFIGS` in `config.py`.
-- **Sensitive data** → Leave `secrets/` untouched/unread unless specifically required.
+- Triage behavior → `QUESTIONS` / `decide_action()` in `relevancy_prompt.py`, thresholds in `config.py`.
+- Backend/protocol → `system_one.py`.
+- Labels → `LABEL_NAMES` in `mailAgent.py`.
+- Leave `secrets/` untouched.

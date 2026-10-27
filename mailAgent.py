@@ -1,14 +1,15 @@
 """
 ================================================================================
-EMAIL CLEANUP AGENT - TRIER MODE
+EMAIL CLEANUP AGENT - TRIER MODE (llama.cpp decision-model backend)
 ================================================================================
 GOALS:
-1. SAFE TRIAGE: Use local LLM (Qwen 3.5 4B) to analyze and categorize emails
-2. PERFORMANCE METRICS: Benchmark local inference speed
+1. SAFE TRIAGE: ask a local decision model (llama.cpp /v1/systemone) whether
+   each email is safe to delete, in ONE request per email; Python decides.
+2. PERFORMANCE METRICS: benchmark local inference speed
 ENVIRONMENT:
 - Runtime: Python 3.x with Gmail API & bs4
-- LLM Engine: Ollama (Local Host)
-- Ollama: qwen3.5:4b
+- Engine: llama-server serving a decision model (not a chat model)
+================================================================================
 """
 
 import os
@@ -17,24 +18,26 @@ import sys
 import time
 import json
 import re
+from urllib.parse import urlparse
 import base64
 import email
 import signal
 import threading
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from email.header import decode_header
-from config import EMAIL_ACCOUNT, USER_NAME, OLLAMA_MODEL, OLLAMA_HOST, ollama_client, MODEL_CONFIGS, DEFAULT_MODEL_CONFIG
+from config import EMAIL_ACCOUNT, USER_NAME, LLAMA_HOST, LLAMA_MODEL, MAX_BODY_CHARS
+from system_one import decide, check_server, DecisionError
 from refresh_oauth_token import get_gmail_service
 from relevancy_prompt import (
-    VALID_DECISIONS,
-    VALID_RULES,
-    MATCHED_RULE_REASONS,
+    QUESTIONS,
     get_category_hint,
-    build_stage1_prompt,
-    build_stage2_prompt,
+    build_state,
+    email_signals,
+    decide_action,
 )
 from bs4 import BeautifulSoup
 from email.utils import parsedate_to_datetime
+from datetime import datetime
 
 BATCH_SIZE = 10  # Number of oldest untagged emails to process per run
 
@@ -66,73 +69,24 @@ def print_progress(index, total, entry):
 
 
 def call_with_timeout(fn, *args, timeout=30, **kwargs):
-    """Run fn(*args, **kwargs) in a thread. Raises TimeoutError or re-raises exceptions."""
-    with ThreadPoolExecutor(max_workers=1) as executor:
+    """Run fn(*args, **kwargs) in a thread. Raises TimeoutError or re-raises exceptions.
+
+    The executor is shut down with wait=False: using it as a context manager
+    would block on exit until the hung call finished, defeating the timeout.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
         future = executor.submit(fn, *args, **kwargs)
         try:
             return future.result(timeout=timeout)
         except FuturesTimeoutError:
             raise TimeoutError(f"API call timed out after {timeout}s")
-
-
-def _run_ollama_chat(prompt):
-    """
-    Send `prompt` to the configured Ollama model and return the raw response
-    text. Shared by both triage stages so the chat_kwargs/model-options
-    plumbing and the dict-vs-ChatResponse response handling only live once.
-    """
-    chat_kwargs = {
-        "model": OLLAMA_MODEL,
-        "messages": [{"role": "user", "content": prompt}],
-    }
-    # Use the model's specific config, falling back to DEFAULT_MODEL_CONFIG
-    # (num_ctx=8192, format=json) for any model not explicitly listed
-    model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
-    if "format" in model_options:  # top-level param in ollama.chat
-        chat_kwargs["format"] = model_options.pop("format")
-    if "think" in model_options:   # top-level param for models that support it
-        chat_kwargs["think"] = model_options.pop("think")
-    if model_options:
-        chat_kwargs["options"] = model_options
-
-    response = ollama_client.chat(**chat_kwargs)
-    # Handle both dict and object (ChatResponse) returns from ollama library
-    if isinstance(response, dict):
-        msg_obj = response.get("message", {})
-        return msg_obj.get("content", "") if isinstance(msg_obj, dict) else str(msg_obj)
-    elif hasattr(response, "message"):
-        # ollama >= 0.2 returns a ChatResponse object: response.message.content
-        msg_obj = response.message
-        return msg_obj.content if hasattr(msg_obj, "content") else str(msg_obj)
-    else:
-        return str(response)
-
-
-def _parse_json_response(response_text):
-    """Strip <think>...</think> blocks / markdown fences a model might emit, then json.loads()."""
-    clean = re.sub(r"<think>.*?</think>", "", response_text, flags=re.DOTALL).strip()
-    clean = re.sub(r"^```(?:json)?", "", clean).strip()
-    clean = re.sub(r"```$", "", clean).strip()
-    return json.loads(clean)
+    finally:
+        executor.shutdown(wait=False)
 
 
 def _decode_mime_header(raw_header):
-    """
-    Fully decode an RFC 2047 MIME-encoded header (e.g. "=?UTF-8?B?...?=")
-    into plain text. Used for Subject, From, and Reply-To — any of these can
-    carry MIME-encoded display names when they contain non-ASCII characters
-    (accents, trademark symbols, emoji, etc.).
-
-    decode_header() can return MULTIPLE (bytes_or_str, encoding) segments for
-    a single header — joining only the first segment (as earlier code did for
-    Subject) silently truncates headers split across more than one encoded
-    word. This joins all of them.
-
-    Passing a raw, undecoded header straight to the LLM is worse than just a
-    display bug: a model given "=?UTF-8?B?VGFyZ2V0...?=" instead of "Target
-    Circle™ Card" has no readable language to identify and may report a
-    language at random — which is exactly the failure mode this fixes.
-    """
+    """Fully decode an RFC 2047 MIME-encoded header into plain text."""
     if not raw_header:
         return ""
     try:
@@ -148,26 +102,15 @@ def _decode_mime_header(raw_header):
         return raw_header
 
 
-# Zero-width / invisible characters marketing platforms pad emails with to
-# defeat spam-filter "too much whitespace" heuristics — most commonly
-# COMBINING GRAPHEME JOINER (U+034F) and SOFT HYPHEN (U+00AD), often
-# repeated hundreds of times separated by ordinary spaces. They're invisible
-# in an email client but render as walls of spaced-out glyphs/boxes in a
-# terminal, so strip them before any other cleanup.
 _INVISIBLE_CHARS_RE = re.compile(
     "[\u034f\u00ad\u200b\u200c\u200d\u2060\ufeff\u180e]"
 )
-# After stripping invisible chars, what's left of those padding blocks is
-# runs of plain spaces — collapse those down too.
 _MULTI_SPACE_RE = re.compile(r"[ \t]{2,}")
-# Lines that are pure leftover HTML-source artifacts (a bracket, a trailing
-# '](url)' with only a URL after it, a bare URL, etc.) that leak through when
-# raw HTML is dumped as visible text.
 _HTML_SOURCE_NOISE_RE = re.compile(
-    r"^\s*(?:\[[^\]]*\]\s*)?\(https?:\/\/[^\s)]*\)\s*$"   # (url) or [t](url)
-    r"|^\s*\]\s*\(https?:\/\/[^\)\s]*\)\s*$"             # ](url)
-    r"|^\s*\[[^\]]*\]\s*$"                                 # [bracket]
-    r"|^\s*https?:\/\/\S+\s*$"                             # bare URL
+    r"^\s*(?:\[[^\]]*\]\s*)?\(https?:\/\/[^\s)]*\)\s*$"
+    r"|^\s*\]\s*\(https?:\/\/[^\)\s]*\)\s*$"
+    r"|^\s*\[[^\]]*\]\s*$"
+    r"|^\s*https?:\/\/\S+\s*$"
 )
 
 
@@ -175,21 +118,12 @@ def clean_text(text_body):
     if not text_body:
         return ""
     soup = BeautifulSoup(text_body, "html.parser")
-    # get_text() does NOT skip <style>/<script> content by default — without
-    # this, HTML emails with large inline CSS blocks (common in bank/marketing
-    # templates) dump hundreds of lines of raw CSS as "text" ahead of the
-    # actual message content, burying anything meaningful past any reasonable
-    # truncation length.
     for tag in soup(["style", "script"]):
         tag.decompose()
     text = soup.get_text(separator="\n")
     text = _INVISIBLE_CHARS_RE.sub("", text)
     text = _MULTI_SPACE_RE.sub(" ", text)
 
-    # Marketing emails dump raw HTML source as visible text (e.g. button blocks
-    # rendered twice, or a template column duplicated), producing repeated lines
-    # and HTML artifacts. Clean line by line: strip whitespace, remove empty
-    # lines and HTML noise, and collapse consecutive duplicate lines.
     cleaned_lines = []
     prev_line = None
     for raw_line in text.split("\n"):
@@ -206,17 +140,31 @@ def clean_text(text_body):
     return "\n".join(cleaned_lines)
 
 
-def load_contacts():
-    """
-    Load contacts and their target labels from YAML.
-    Returns a dict mapping lowercase email address -> target label name
-    (defaulting to LABEL_NAMES["ATTENTION"] if no label is specified).
+_URL_RE = re.compile(r"(?:https?://|www\.)[^\s<>\"')\]]+", re.IGNORECASE)
 
-    Supports formats:
-    - List of email strings: ['user@example.com']
-    - List of dicts: [{'email': 'user@example.com', 'label': 'Personal'}] or [{'user@example.com': 'Personal'}]
-    - Dict mapping: {'user@example.com': 'Personal'} or {'trusted': {'user@example.com': 'Personal'}}
-    """
+
+def _url_to_placeholder(match):
+    """https://www.linkedin.com/comm/x?y=z -> <linkedin.com/link> (keeps the domain, drops the noise)."""
+    url = match.group(0)
+    trailing = ""
+    while url and url[-1] in ".,;:!?":
+        trailing = url[-1] + trailing
+        url = url[:-1]
+    host = urlparse(url if "//" in url else "//" + url).hostname or ""
+    host = host.lower().removeprefix("www.")
+    return (f"<{host}/link>" if host else "<link>") + trailing
+
+
+def strip_urls(text):
+    """Replace URLs with <domain/link> (tracking links are noise and eat the model's context)."""
+    if not text:
+        return ""
+    text = _URL_RE.sub(_url_to_placeholder, text)
+    lines = (_MULTI_SPACE_RE.sub(" ", ln).strip() for ln in text.split("\n"))
+    return "\n".join(ln for ln in lines if ln)
+
+
+def load_contacts():
     if not os.path.exists(CONTACTS_FILE):
         return {}
     try:
@@ -265,7 +213,6 @@ def load_contacts():
 
 
 def save_contact(name, email_addr, target_label=None, notes=""):
-    """Add or update an email address and target label in contacts.yml."""
     email_addr = email_addr.strip().lower()
     target_label = (target_label or LABEL_NAMES["ATTENTION"]).strip()
 
@@ -318,7 +265,6 @@ def save_contact(name, email_addr, target_label=None, notes=""):
 
 
 def parse_sender(raw_from):
-    """Extract (name, email_addr) from a raw From header like 'Name <addr@x.com>'."""
     import re as _re
     m = _re.match(r'^(.*?)\s*<([^>]+)>', raw_from.strip())
     if m:
@@ -331,7 +277,6 @@ def parse_sender(raw_from):
 
 
 def get_or_create_label(service, name):
-    """Return the Gmail label ID for `name`, creating it if it doesn't exist."""
     existing = service.users().labels().list(userId="me").execute()
     for label in existing.get("labels", []):
         if label["name"] == name:
@@ -349,10 +294,6 @@ def get_or_create_label(service, name):
 
 
 def fetch_untagged_emails(service, label_ids, batch_size):
-    """
-    Fetch the first batch_size INBOX emails that do not have any triage label.
-    Uses newest-first order (Gmail default) — cheap: stops as soon as we have enough.
-    """
     exclude_ids = set(label_ids.values())
     pool = []
     page_token = None
@@ -396,26 +337,10 @@ def fetch_untagged_emails(service, label_ids, batch_size):
 
 
 def get_gmail_link(msg_id):
-    """Build a direct link to open this message in the Gmail web UI.
-    '#all' works whether or not the message is still in the INBOX
-    (e.g. after being archived by the DELETE label)."""
     return f"https://mail.google.com/mail/u/0/#all/{msg_id}"
 
 
 def list_gmail_labels(service, exclude_names=None):
-    """Return [(id, name), ...] of the user's own custom Gmail labels/folders,
-    sorted by name — suitable as a "move to" target list.
-
-    Filters out:
-    - All Gmail SYSTEM labels (type == "system"): INBOX, SENT, CATEGORY_*,
-      YELLOW_STAR, IMPORTANT, SPAM, TRASH, DRAFT, CHAT, UNREAD, STARRED,
-      etc. None of these are meaningful "move this email to a folder"
-      destinations — CATEGORY_* in particular is Gmail's own auto-classifier
-      and re-adding it does nothing useful.
-    - This app's own triage labels (1-ToDelete / 1-NeedAttention /
-      1-ProcessError), passed in via `exclude_names` — showing them here
-      would just duplicate the L / L.# quick-toggle already on this menu.
-    """
     try:
         result = call_with_timeout(service.users().labels().list(userId="me").execute)
     except Exception as e:
@@ -431,14 +356,6 @@ def list_gmail_labels(service, exclude_names=None):
 
 
 def show_message_detail(service, e, label_ids, delete_ids):
-    """
-    Full detail view for one triaged message (invoked via M / M.#): shows a
-    Gmail link, the extracted body text, and a small submenu to either flip
-    the ToDelete/NeedAttention label (same quick-toggle as the top-level L
-    option) or move the message to any other Gmail label. `delete_ids` is
-    the batch's live list and is mutated in place so the Trash count on the
-    main menu stays accurate after returning.
-    """
     while True:
         name, addr = parse_sender(e["sender"])
         current_label_name = e.get("custom_label_name") or LABEL_NAMES.get(e["decision"], e["decision"])
@@ -558,7 +475,6 @@ def show_message_detail(service, e, label_ids, delete_ids):
                     delete_ids.remove(e["id"])
                 e["custom_label_id"] = new_label_id
                 e["custom_label_name"] = new_label_name
-                # Keep in triage batch under custom group
                 e["decision"] = new_label_name
                 print(f"\n  ✅ Moved to label: {new_label_name}\n")
             except Exception as ex:
@@ -569,8 +485,6 @@ def show_message_detail(service, e, label_ids, delete_ids):
 
         else:
             print("  Unrecognised option. Please choose L, C, or B.\n")
-        # L and C return here to the main list (B) instead of re-showing
-        # the submenu — B itself returns immediately above.
         break
 
 
@@ -588,30 +502,13 @@ def triage_and_label_emails():
         print(f"❌ Failed to connect to Gmail: {e}")
         return
 
-    # Check Ollama & force cold start
+    # Check llama.cpp is up and serving a decision model (also warms it up)
     try:
-        available = ollama_client.list()
-        if not available.get("models"):
-            print("⚠️  No Ollama models available")
-            return
-
-        print("Warming up model (cold start)...")
-        chat_kwargs = {
-            "model": OLLAMA_MODEL,
-            "messages": [{"role": "user", "content": "Hello"}],
-            "stream": False,
-        }
-        model_options = MODEL_CONFIGS.get(OLLAMA_MODEL, DEFAULT_MODEL_CONFIG).copy()
-        if "think" in model_options:
-            chat_kwargs["think"] = model_options.pop("think")
-        model_options.pop("format", None)
-        if model_options:
-            chat_kwargs["options"] = model_options
-
-        ollama_client.chat(**chat_kwargs)
-        print(f"✓ Model warmed up {OLLAMA_MODEL} ({OLLAMA_HOST})")
-    except Exception as e:
-        print(f"⚠️  Ollama unavailable or warmup failed: {e}")
+        print("Checking decision model...")
+        check_server()
+        print(f"✓ Decision model ready ({LLAMA_MODEL or 'server default'} @ {LLAMA_HOST})")
+    except DecisionError as e:
+        print(f"⚠️  {e}")
         return
 
     # Ensure triage labels exist
@@ -634,29 +531,24 @@ def triage_and_label_emails():
 
     total_emails = len(messages)
 
-    metrics = {key: 0 for key in LABEL_NAMES}  # DELETE, ATTENTION, ERROR
+    metrics = {key: 0 for key in LABEL_NAMES}
     metrics["ERROR_FALLBACK"] = 0
-    ai_times = []       # total per-email inference time (stage 1, or stage 1+2 combined)
-    stage1_times = []   # stage 1 call time only, recorded for every email
-    stage2_times = []   # stage 2 call time only, recorded only for UNSURE escalations
-    delete_ids = []    # IDs labelled DELETE in this batch only
-    batch_senders = [] # (msg_id, sender_raw, subject, decision) for each processed email
+    ai_times = []
+    delete_ids = []
+    batch_senders = []
     contacts = load_contacts()
-
 
     for index, msg_ref in enumerate(messages, start=1):
         if _stop.is_set():
             print("\n⚠️  Stopped by user.")
             break
 
-        # Fetch full message
         try:
             msg_data = call_with_timeout(
                 service.users().messages().get(
                     userId="me", id=msg_ref["id"], format="raw"
                 ).execute
             )
-            # Capture Gmail category labels from the message metadata
             gmail_labels = msg_data.get("labelIds", [])
             raw = base64.urlsafe_b64decode(msg_data["raw"].encode("utf-8"))
             msg = email.message_from_bytes(raw)
@@ -665,33 +557,24 @@ def triage_and_label_emails():
             metrics["ERROR_FALLBACK"] += 1
             continue
 
-        # Extract headers — decode_header() handles RFC 2047 MIME encoding
-        # (e.g. "=?UTF-8?B?...?="), which Gmail/senders use for any non-ASCII
-        # character in a header (accents, trademark symbols, emoji). Applied
-        # to Subject, From, AND Reply-To — a raw, undecoded header passed to
-        # the LLM looks like meaningless base64 noise, not real text.
         subject = _decode_mime_header(msg.get("Subject")) or "No Subject"
         sender = _decode_mime_header(msg.get("From")) or "Unknown"
         reply_to = _decode_mime_header(msg.get("Reply-To"))
-        # Simplify date: remove time portion
         raw_date = msg.get("Date") or "Unknown"
         
         try:
             dt = parsedate_to_datetime(raw_date)
             date = dt.strftime("%m/%d/%y")
-            # Calculate days old for the LLM hint
-            days_old = (datetime.now() - dt).days
+            days_old = (datetime.now(dt.tzinfo) - dt).days
         except Exception:
             date = re.sub(r'\d{2}:\d{2}:\d{2}.*', '', raw_date).strip()
             days_old = None
 
-        # Map Gmail category labels to human-readable hints (logic lives in relevancy_prompt.py)
         gmail_category, category_hint = get_category_hint(gmail_labels)
 
         _, sender_addr = parse_sender(sender)
         sender_contact_label = contacts.get(sender_addr.lower())
 
-        # Track for end-of-batch menu and final detailed report (decision/timing filled in below)
         entry = {
             "id": msg_ref["id"],
             "sender": sender,
@@ -708,7 +591,7 @@ def triage_and_label_emails():
             "custom_label_name": None,
         }
         batch_senders.append(entry)
-        # Extract body
+
         plain_body = ""
         html_fallback = ""
         if msg.is_multipart():
@@ -731,13 +614,6 @@ def triage_and_label_emails():
             except Exception:
                 plain_body = ""
 
-        # Many transactional/bill emails (statements, invoices, receipts) ship a
-        # plaintext alternative that LOOKS substantial (unsubscribe boilerplate,
-        # privacy/security links, footer address) but never actually contains
-        # the real numbers — those live only in the HTML version's summary
-        # table. Plaintext length alone is not a reliable signal of substance,
-        # so check for an actual dollar figure: if the HTML has one and the
-        # plaintext doesn't, the HTML is the version worth reading.
         def _has_dollar_amount(text):
             return re.search(r'\$[\d,]+\.\d{2}', text) is not None
 
@@ -751,11 +627,8 @@ def triage_and_label_emails():
         else:
             body = plain_body
 
-        # Keep a longer, unsliced-for-the-LLM copy for the M.# detail view —
-        # the 1500-char slice below is tuned for prompt budget, not readability.
-        entry["body_preview"] = body[:5000]
-
-        body = body[:1500]
+        body = strip_urls(body)[:MAX_BODY_CHARS]  # model sees text only, no tracking links
+        entry["body_preview"] = body  # detail view shows exactly what the model saw
 
         if sender_contact_label:
             if sender_contact_label.upper() == "ATTENTION" or sender_contact_label == LABEL_NAMES["ATTENTION"]:
@@ -787,7 +660,7 @@ def triage_and_label_emails():
                 call_with_timeout(
                     service.users().messages().modify(
                         userId="me", id=msg_ref["id"],
-                        body={"addLabelIds": [target_label_id], "removeLabelIds": ["INBOX"]}
+                        body={"addLabelIds": [target_label_id], "removeLabelIds": [] if decision == "ATTENTION" else ["INBOX"]}
                     ).execute
                 )
             except (TimeoutError, Exception) as e:
@@ -800,108 +673,44 @@ def triage_and_label_emails():
             print_progress(index, total_emails, entry)
             continue
 
-        # ── Stage 1: cheap triage — sorts into KEEP / DISCARD / UNSURE ──────
-        stage1_prompt = build_stage1_prompt(
+        # ── Single-stage decision-model triage ─────────────────────────────
+        facts, signals = email_signals(
+            sender,
+            reply_to=reply_to,
+            list_unsubscribe=bool(msg.get("List-Unsubscribe")),
+            precedence=msg.get("Precedence") or "",
+        )
+        state = build_state(
             sender=sender,
             date=date,
             subject=subject,
             body=body,
             category_hint=category_hint,
             days_old=days_old,
+            user_name=USER_NAME,
+            reply_to=reply_to,
+            facts=facts,
         )
-
-        summary = ""
-        reason = ""
-        decision = None
 
         ai_start = time.time()
         try:
-            stage1_text = _run_ollama_chat(stage1_prompt)
+            answers = decide(state, QUESTIONS)
+            decision, reason, _ = decide_action(answers, signals)
         except KeyboardInterrupt:
             raise
-        except Exception as e:
-            elapsed = time.time() - ai_start
-            ai_times.append(elapsed)
-            stage1_times.append(elapsed)
-            entry["elapsed"] = elapsed
-            entry["reason"] = f"Ollama error (stage 1): {e}"
-            entry["decision"] = "ERROR"
-            metrics["ERROR_FALLBACK"] += 1
-            try:
-                call_with_timeout(
-                    service.users().messages().modify(
-                        userId="me", id=msg_ref["id"],
-                        body={"addLabelIds": [label_ids["ERROR"]], "removeLabelIds": []}
-                    ).execute
-                )
-            except Exception as label_err:
-                entry["reason"] += f" | ⚠️ Could not apply error label: {label_err}"
-            print_progress(index, total_emails, entry)
-            continue
-
-        stage1_elapsed = time.time() - ai_start
-        stage1_times.append(stage1_elapsed)
-
-        verdict = None
-        matched_rule = "UNSURE"
-        try:
-            stage1_result = _parse_json_response(stage1_text)
-            matched_rule = stage1_result.get("matched_rule", "UNSURE").upper()
-        except Exception:
-            reason = f"Could not parse stage 1 response. Raw: {stage1_text[:120]!r}"
-            metrics["ERROR_FALLBACK"] += 1
-
-        if matched_rule in ["MONEY", "DEADLINE", "NOTICE", "PROMO"]:
-            decision = "ATTENTION"
-            reason = MATCHED_RULE_REASONS.get(matched_rule, "Stage 1 matched a keep-worthy rule.")
-        elif matched_rule == "JUNK":
-            decision = "DELETE"
-            reason = MATCHED_RULE_REASONS.get("JUNK", "Stage 1 matched generic/junk criteria.")
-        elif matched_rule == "UNSURE":
-            # ── Stage 2: only for genuinely ambiguous survivors ─────────────
-            stage2_prompt = build_stage2_prompt(
-                sender=sender,
-                date=date,
-                subject=subject,
-                body=body,
-                category_hint=category_hint,
-                user_name=USER_NAME,
-                reply_to=reply_to,
-            )
-            stage2_start = time.time()
-            try:
-                stage2_text = _run_ollama_chat(stage2_prompt)
-                stage2_times.append(time.time() - stage2_start)
-                stage2_result = _parse_json_response(stage2_text)
-                decision = stage2_result.get("decision", "").upper()
-                summary = stage2_result.get("summary", "")
-                reason = stage2_result.get("reason", "No reason provided.")
-                if decision not in VALID_DECISIONS:
-                    reason = f"Stage 2 returned unrecognised decision {decision!r}. {reason}"
-                    decision = "ERROR"
-                    metrics["ERROR_FALLBACK"] += 1
-            except KeyboardInterrupt:
-                raise
-            except Exception as e:
-                stage2_times.append(time.time() - stage2_start)
-                decision = "ERROR"
-                reason = f"Stage 2 error/parse failure: {e}"
-                metrics["ERROR_FALLBACK"] += 1
-        else:
+        except (DecisionError, ValueError) as e:
             decision = "ERROR"
-            reason = f"Stage 1 returned unrecognised rule: {matched_rule!r}"
+            reason = f"Decision model error: {e}"
             metrics["ERROR_FALLBACK"] += 1
 
         elapsed = time.time() - ai_start
         ai_times.append(elapsed)
-
         metrics[decision] = metrics.get(decision, 0) + 1
 
         entry["elapsed"] = elapsed
-        entry["summary"] = summary
+        entry["summary"] = ""  # decision models write no prose
         entry["reason"] = reason
 
-        # Apply label — DELETE removes from INBOX (archived), ATTENTION/ERROR keep it visible
         labels_to_remove = ["INBOX"] if decision == "DELETE" else []
         try:
             call_with_timeout(
@@ -920,12 +729,6 @@ def triage_and_label_emails():
 
         print_progress(index, total_emails, entry)
 
-
-    # ── Detailed results ──────────────────────────────────────────────────────
-    # Grouped by Custom Labels (if any) → NeedAttention → ProcessError → ToDelete,
-    # sorted within each group by relevance score (highest first; unscored —
-    # e.g. trusted-sender skips — sort last). Message numbers below reflect
-    # this displayed order, not the order emails were originally processed.
     GROUP_ICONS = {"ATTENTION": "👁️ ", "ERROR": "⚙️ ", "DELETE": "🗑️ "}
 
     def _get_group_order(entries):
@@ -938,10 +741,6 @@ def triage_and_label_emails():
     grouped_entries = []
 
     def print_detailed_results():
-        """Reprints the numbered DETAILED RESULTS list — called once after the
-        batch finishes, and again whenever the user backs out of the M.#
-        message-detail view so the numbering stays visible/current (labels may
-        have changed via L/C while in that view)."""
         nonlocal grouped_entries
         grouped_entries = []
         group_order = _get_group_order(batch_senders)
@@ -977,11 +776,8 @@ def triage_and_label_emails():
 
     print_detailed_results()
 
-    # ── Summary report ────────────────────────────────────────────────────────
     total_processed = len(batch_senders)
-    avg_blended_time = sum(ai_times) / len(ai_times) if ai_times else 0
-    avg_stage1_time = sum(stage1_times) / len(stage1_times) if stage1_times else 0
-    avg_stage2_time = sum(stage2_times) / len(stage2_times) if stage2_times else 0
+    avg_time = sum(ai_times) / len(ai_times) if ai_times else 0
 
     print("\n" + "=" * 40)
     print("      BATCH PERFORMANCE REPORT")
@@ -996,16 +792,10 @@ def triage_and_label_emails():
             print(f"  {icon}{display_name:<20}: {cnt}")
     if metrics.get("ERROR_FALLBACK"):
         print(f"⚠️  Errors         : {metrics['ERROR_FALLBACK']}")
-    print(f"Avg Inference    : {avg_blended_time:.2f}s  (blended stage 1 / stage 1+2)")
-    print(f"  Stage 1 avg    : {avg_stage1_time:.2f}s  ({len(stage1_times)} calls)")
-    if stage2_times:
-        print(f"  Stage 2 avg    : {avg_stage2_time:.2f}s  ({len(stage2_times)} escalated to stage 2)")
-    else:
-        print(f"  Stage 2 avg    : n/a (no emails escalated to stage 2)")
+    print(f"Avg Inference    : {avg_time:.2f}s  (1 decision call per email)")
     print(f"Total Time       : {sum(ai_times):.2f}s")
     print("=" * 40 + "\n")
 
-    # ── Post-batch menu ────────────────────────────────────────────────────────
     delete_count = len(delete_ids)
 
     def _prompt_add_contact(e):
@@ -1114,12 +904,10 @@ def triage_and_label_emails():
             else:
                 print("  Skipped — emails remain labelled but not trashed.\n")
 
-        # Handle 'a' for Add sender
         elif choice.startswith("a."):
             try:
-                # Split 'a.N' and get N, then convert to 0-based index
                 index_str = choice.split('.', 1)[1]
-                sel_idx = int(index_str) - 1 # User enters 1-based index
+                sel_idx = int(index_str) - 1
                 if not (0 <= sel_idx < len(grouped_entries)):
                     raise ValueError("Index out of bounds")
                 _prompt_add_contact(grouped_entries[sel_idx])
@@ -1127,7 +915,7 @@ def triage_and_label_emails():
                 print("  Invalid selection format. Use 'A' to select from list or 'A.N' (e.g., A.3) for direct selection.\n")
                 continue
 
-        elif choice == "a": # If it was just 'a', proceed with interactive selection
+        elif choice == "a":
             if not grouped_entries:
                 print("  No senders available.\n")
                 continue
@@ -1154,7 +942,6 @@ def triage_and_label_emails():
                 continue
             _prompt_add_contact(grouped_entries[sel_idx])
 
-        # Handle 'm' for View message details
         elif choice.startswith("m."):
             try:
                 index_str = choice.split('.', 1)[1]
@@ -1169,7 +956,7 @@ def triage_and_label_emails():
             delete_count = len(delete_ids)
             print_detailed_results()
 
-        elif choice == "m": # If it was just 'm', proceed with interactive selection
+        elif choice == "m":
             if not grouped_entries:
                 print("  No messages available in this batch.\n")
                 continue

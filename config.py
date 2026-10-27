@@ -1,99 +1,58 @@
 """
 MailAgent Configuration Manager
-Environment-based configuration for security
+Environment-based configuration (llama.cpp decision-model backend).
+Importing this module has no side effects beyond loading secrets/.env.
 """
 import os
-import json
-from dotenv import load_dotenv
 from pathlib import Path
+from dotenv import load_dotenv
 
-# Load environment variables from secrets/.env (if exists)
 SECRETS_DIR = Path(__file__).parent / "secrets"
 load_dotenv(SECRETS_DIR / ".env")
 
 # ============================================
 # AUTHENTICATION
-# Credentials come from Google's credential store, loaded by refresh_oauth_token.py.
-# The credentials.json + token.json pattern is the only one we need:
-#   1. First run: OAuth consent → creates both .json files under secrets/
-#   2. Subsequent runs: refresh_oauth_token.py loads/refreshes them automatically
-# No client-id/client-secret env vars are needed — they're embedded in credentials.json.
-
-# Gmail account address (display/logging only)
+# Gmail credentials come from Google's credential store, loaded by refresh_oauth_token.py.
 EMAIL_ACCOUNT = os.getenv("EMAIL_ACCOUNT", "")
-
-# User's own name, so the triage prompt can check whether an email actually
-# addresses them personally (a signal of genuine correspondence vs a mass
-# sales pitch). Leave unset in .env to skip that signal.
 USER_NAME = os.getenv("USER_NAME", "")
 
-# Check if Ollama is running
-import ollama as ollama_client
-OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "qwen2.5:3b-instruct")
-OLLAMA_CLIENT = ollama_client
+# ============================================
+# Ollama decision-model server
+# Defaults to local Ollama installation.
+OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://127.0.0.1:11434").strip().rstrip("/")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "d3:2b")
+# Backward-compatible aliases (mailAgent.py imports these names).
+LLAMA_HOST = OLLAMA_HOST
+LLAMA_MODEL = OLLAMA_MODEL
+LLAMA_API_KEY = os.getenv("LLAMA_API_KEY", "").strip()
+REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "90"))
 
-# Fallback options for any model not listed in MODEL_CONFIGS below. 4096
-# tokens is comfortably more than the triage prompt needs (instructions +
-# the 1500-char truncated email body come to well under 1500 tokens), so
-# there's no need to give every model its own entry just to set this.
-DEFAULT_MODEL_CONFIG = {
-    "num_ctx": 4096,
-    "format": "json",
-}
-
-# Per-model Ollama options. Set to None to use Ollama defaults for that model.
-# Only add an entry here if a model needs something different from
-# DEFAULT_MODEL_CONFIG (e.g. a bigger context window, tuned temperature/top_p,
-# or think=False for models that support "thinking" mode).
-# Note: think=False is passed as a top-level ollama.chat() param, not here.
-MODEL_CONFIGS = {
-    "qwen3.5:4b": { "format": "json",
-        "num_ctx": 16384,
-        "temperature": 0.5,
-        "top_p": 0.8,
-    },
-    "qwen3.5:2b": { "format": "json",
-        "num_ctx": 16384,
-        "temperature": 0.7,
-        "top_p": 0.8,
-    },
-    "lfm2.5:8b": { "format": "json",
-        "num_ctx": 4096,
-        "temperature": 0.2,
-        "top_k": 80,
-        "repetition_penalty": 1.05,
-    },
-}
-
-try:
-    available = ollama_client.list()
-    has_models = len(available.get('models', [])) > 0
-    if has_models:
-        print(f"✅ Ollama is running")
-    else:
-        print(f"⚠️  Warning: No Ollama models detected")
-except Exception as e:
-    print(f"⚠️  Could not connect to Ollama: {e}")
-
-# Label folder path
-LABELS_PATH = os.getenv("LABELS_PATH", "config/labels.json")
-
-# Server Settings
-IMAP_SERVER = "imap.gmail.com"
-IMAP_PORT = 993
+# ============================================
+# TRIAGE TUNING - confidence cutoffs differ per model; test on your own inbox.
+# You review everything before trashing, so a wrong DELETE costs little and a missed one
+# costs a manual cleanup: the defaults lean toward recommending delete.
+#
+# HARD keep-signals (record / personal) at or above this keep the email.
+HARD_KEEP_MIN = float(os.getenv("HARD_KEEP_MIN", "0.50"))
+# The SOFT keep-signal (actionable) is vague and fires on ordinary marketing mail,
+# so it only keeps the email at this higher score.
+SOFT_KEEP_MIN = float(os.getenv("SOFT_KEEP_MIN", "0.80"))
+# "Sent in bulk / automatically" probability needed to recommend DELETE...
+DELETE_MIN_PROB = float(os.getenv("DELETE_MIN_PROB", "0.50"))
+# ...and the lower bar used when code sees an unsubscribe/bulk header or an automated sender.
+DELETE_MIN_PROB_BULK_HEADER = float(os.getenv("DELETE_MIN_PROB_BULK_HEADER", "0.35"))
+# Characters of body text sent to the model (decision models have small contexts).
+MAX_BODY_CHARS = int(os.getenv("MAX_BODY_CHARS", "1500"))
 
 if not EMAIL_ACCOUNT:
     print("⚠️  WARNING: EMAIL_ACCOUNT not set in secrets/.env")
-
-
-
-# ============================================
-# End of Authentication Configuration
-# ============================================
 
 if __name__ == "__main__":
     print("\nConfiguration Summary:")
     print(f"  Gmail account: {EMAIL_ACCOUNT or '(not set)'}")
     print(f"  Credentials file: {SECRETS_DIR / 'credentials.json'}")
     print(f"  Token file: {SECRETS_DIR / 'token.json'}")
+    print(f"  llama.cpp host: {OLLAMA_HOST}")
+    print(f"  API key: {'set' if LLAMA_API_KEY else '(none)'}")
+    print(f"  Model: {OLLAMA_MODEL or '(server default)'}")
+    print(f"  HARD_KEEP_MIN={HARD_KEEP_MIN}  SOFT_KEEP_MIN={SOFT_KEEP_MIN}  DELETE_MIN_PROB={DELETE_MIN_PROB}  DELETE_MIN_PROB_BULK_HEADER={DELETE_MIN_PROB_BULK_HEADER}")
